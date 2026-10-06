@@ -1,8 +1,18 @@
 --!nonstrict
--- 肌肉之王自动化 v38
-local PLUGIN_ID = "__MK_AUTO_V38__"
-local VERSION = 3800
-local CONFIG_FILE = "mk_auto_v38.json"
+-- 肌肉之王自动化 v39
+local PLUGIN_ID = "__MK_AUTO_V39__"
+local VERSION = 3900
+local CONFIG_FILE = "mk_auto_v39.json"
+-- ★ 旧版本清理 + 配置继承
+local OLD_PLUGIN_IDS = {"__MK_AUTO_V38__", "__MK_AUTO_V37__", "__MK_AUTO_V36__", "__MK_AUTO_V35__"}
+local OLD_CONFIGS    = {"mk_auto_v38.json", "mk_auto_v37.json", "mk_auto_v36.json", "mk_auto_v35.json"}
+for _, oldId in ipairs(OLD_PLUGIN_IDS) do
+    local old = _G[oldId]
+    if old then
+        if type(old.cleanup) == "function" then pcall(old.cleanup) end
+        _G[oldId] = nil
+    end
+end
 if _G[PLUGIN_ID] then
     if _G[PLUGIN_ID].version and _G[PLUGIN_ID].version >= VERSION then return end
     if type(_G[PLUGIN_ID].cleanup) == "function" then pcall(_G[PLUGIN_ID].cleanup) end
@@ -49,7 +59,7 @@ local S = {
     version = VERSION, destroyed = false,
     threads = {}, conns = {}, ui = {},
     Info = { rows = {}, frames = {} },
-    UIState = { pillPos = nil },
+    UIState = { pillPos = nil, confirmOpen = false },
     pingHistory = {}, activeNotifies = {},
     friendWL = { ids = {}, loaded = false, refreshing = false, lastRefresh = 0, lastAttempt = 0 },
     repCache = { pet = 0, ult = 0, x2 = false, speedMul = 1, lastRefresh = 0, lastPassCheck = 0 },
@@ -112,6 +122,10 @@ local S = {
     _bossActive = false, _bossSavedDual = nil, _bossSavedMachine = nil,
     _lastRebCheck = 0, _lastRebVal = 0, rebirthPerSec = 0,
     _cfPriority = 0, _cfTarget = nil, _cfSetAt = 0,
+    -- ★ 新增
+    _origWalkSpeed = 16, _origJumpPower = 50, _origJumpHeight = 7.2,
+    _enlargedTargets = {},
+    _lastKillEnlarge = 0,
     theme = {
         Bg=C3(16,18,24), Bg2=C3(22,25,33), Surface=C3(30,34,44), SurfaceAlt=C3(40,46,58),
         Border=C3(68,76,94), Accent=C3(100,170,255), Accent2=C3(60,120,220),
@@ -120,7 +134,6 @@ local S = {
     },
 }
 
--- 翻译表
 S.MACHINE_TRANSLATE = {
     ["Squat Rack"]="深蹲架", ["Bench Press"]="卧推台", ["Deadlift"]="硬拉台",
     ["Pullups"]="引体向上", ["Boulder Throw"]="巨石投掷",
@@ -207,7 +220,6 @@ S.PET_TRANSLATE = {
 S.translateMachine = function(n) return S.MACHINE_TRANSLATE[n] or n end
 S.translateGym = function(n) return S.GYM_TRANSLATE[n] or n end
 S.translatePet = function(n) return S.PET_TRANSLATE[n] or n end
-S.bilingualMachine = function(n) return S.translateMachine(n) end
 S.bilingualPet = function(n)
     local cn = S.PET_TRANSLATE[n]; if cn then return cn.." ("..n..")" end; return n
 end
@@ -311,7 +323,17 @@ S.myDurability = function() return S.stat(LP, "Durability") end
 S.refreshCache = function()
     local c = LP.Character
     local C = S.cache
-    if c ~= C.char then C.char = c; C.hum = nil; C.hrp = nil; S.releaseGravityLock() end
+    if c ~= C.char then
+        C.char = c; C.hum = nil; C.hrp = nil
+        S.releaseGravityLock()
+        -- ★ 记录原始移动参数
+        if c then
+            local hum = c:FindFirstChildOfClass("Humanoid")
+            if hum then
+                S._origWalkSpeed = hum.WalkSpeed > 0 and hum.WalkSpeed or 16
+            end
+        end
+    end
     if c then
         if not C.hum or not C.hum.Parent then C.hum = c:FindFirstChildOfClass("Humanoid") end
         if not C.hrp or not C.hrp.Parent then C.hrp = c:FindFirstChild("HumanoidRootPart") end
@@ -419,7 +441,6 @@ end
 S.cancelThread = function(key) if S.threads[key] then pcall(function() task.cancel(S.threads[key]) end); S.threads[key] = nil end end
 S.cancelAllThreads = function() for k in pairs(S.threads) do S.cancelThread(k) end end
 
--- CFrame 优先级锁
 S.setCFrame = function(pos, priority)
     if (S._cfPriority or 0) > priority then return end
     S._cfPriority = priority
@@ -490,6 +511,43 @@ S.isTargetSafe = function(plr)
     return (theirEHP / math.max(myStr, 1)) < (myEHP / math.max(theirStr, 1)) * 0.8
 end
 
+-- ★ 放大敌人
+S.enlargeTarget = function(plr)
+    if not plr or not plr.Character then return end
+    if S._enlargedTargets[plr.UserId] then return end
+    local record = {}
+    for _, part in ipairs(plr.Character:GetDescendants()) do
+        if part:IsA("BasePart") then
+            record[part] = part.Size
+            pcall(function()
+                part.Size = part.Size * V3(2.5, 2.5, 2.5)
+                part.CanCollide = false
+            end)
+        end
+    end
+    S._enlargedTargets[plr.UserId] = record
+end
+
+S.restoreEnlarged = function(plr)
+    if not plr then return end
+    local record = S._enlargedTargets[plr.UserId]
+    if not record then return end
+    for part, size in pairs(record) do
+        if part and part.Parent then
+            pcall(function() part.Size = size end)
+        end
+    end
+    S._enlargedTargets[plr.UserId] = nil
+end
+
+S.restoreAllEnlarged = function()
+    for userId in pairs(S._enlargedTargets) do
+        local plr = Players:GetPlayerByUserId(userId)
+        if plr then S.restoreEnlarged(plr) end
+    end
+    table.clear(S._enlargedTargets)
+end
+
 -- 宝箱
 S.findNearbyChest = function()
     local best, bestDist = nil, math.huge
@@ -552,13 +610,23 @@ S.unequipAllPets = function()
         end
     end
 end
+-- ★ 加速版（无 wait）
 S.applyPetPreset = function(presetType)
     local preset = S.petPreset[presetType]; if not preset or #preset == 0 then return end
     if S.petPreset.activeType == presetType then return end
     S.petPreset.activeType = presetType
-    S.unequipAllPets(); task.wait(0.05)
     local r = ReplicatedStorage:FindFirstChild("rEvents")
     local ev = r and r:FindFirstChild("equipPetEvent"); if not ev then return end
+    local pf = LP:FindFirstChild("petsFolder")
+    if pf then
+        for _, folder in ipairs(pf:GetChildren()) do
+            if folder:IsA("Folder") then
+                for _, pet in ipairs(folder:GetChildren()) do
+                    pcall(function() ev:FireServer("unequipPet", pet) end)
+                end
+            end
+        end
+    end
     for _, entry in ipairs(preset) do
         local instances = S.getOwnedPetInstancesByName(entry.name)
         for i = 1, math.min(entry.count or 1, #instances) do
@@ -584,6 +652,7 @@ S.pauseScript = function()
     S.killEnabled=false; S.autoKingKill=false; S.autoBoss=false; S.autoChest=false
     S.autoPackRebirth=false; S.autoEatEgg=false; S.autoPetBuy=false; S.autoWheel=false
     S.machineState.enabled=false; S.machineTeleport.enabled=false; S.teleportLoopEnabled=false
+    S.restoreAllEnlarged()
     S.releaseGravityLock()
     pcall(function() Workspace.Gravity = S.originalGravity end)
     pcall(function()
@@ -605,7 +674,7 @@ S.resumeScript = function()
     end
     pcall(function()
         local hum = S.cache.hum
-        if hum then hum.WalkSpeed=16 end
+        if hum then hum.WalkSpeed = S._origWalkSpeed end
     end)
     S.scriptPaused = false; S.pausedSnapshot = nil
     S.notify("脚本已恢复", 3)
@@ -798,8 +867,6 @@ S.getMachineGym = function(seatPos)
     end
     return closest or "未知", minDist
 end
-
--- ★ 每个器械独立 interactSeat
 S.getMachineSeats = function()
     local folder = Workspace:FindFirstChild("machinesFolder"); if not folder then return {} end
     local seats = {}
@@ -944,7 +1011,6 @@ S.teleportToMachine = function()
         hrp.CFrame = CN(seat.Position + V3(0, 3, 0))
         hrp.AssemblyLinearVelocity = V3(0,0,0); hrp.AssemblyAngularVelocity = V3(0,0,0)
     end)
-    -- 每个器械独立触发
     local ev = ReplicatedStorage:FindFirstChild("rEvents")
     ev = ev and ev:FindFirstChild("machineInteractRemote")
     if ev then
@@ -952,7 +1018,6 @@ S.teleportToMachine = function()
         if ok then S.machineState.using = true; S.machineState.failCount = 0
         else
             S.machineState.failCount = S.machineState.failCount + 1
-            -- 尝试 model 内其他 seat
             local parent = seat.Parent
             if parent then
                 for _, alt in ipairs(parent:GetDescendants()) do
@@ -1041,7 +1106,6 @@ S.refreshFriendList = function()
 end
 S.isFriend = function(plr) if not plr or not plr.UserId then return false end return S.friendWL.ids[plr.UserId] == true end
 
--- 反复速度（修正公式）
 S.refreshRepSpeed = function()
     local RC = S.repCache
     local sumPct = 0
@@ -1219,6 +1283,13 @@ S.runKillTick = function()
         if not valid then S.killTarget = S.selectKillTarget()
         elseif not S.isTargetSafe(S.killTarget) then S.killTarget = S.selectKillTarget() end
         S.toolOwnedByKill = S.killTarget ~= nil
+        -- ★ 放大当前目标
+        if S.killTarget then
+            if tick() - (S._lastKillEnlarge or 0) > 2 then
+                S._lastKillEnlarge = tick()
+                S.enlargeTarget(S.killTarget)
+            end
+        end
     end
     local t = S.killTarget; if not t then return end
     local hrp = S.getCharHRP(t); if not hrp then S.killTarget = nil; return end
@@ -1257,6 +1328,7 @@ S.runKingKillTick = function()
     local hrp = S.getCharHRP(t)
     if not hrp then S.kingKillTarget = nil; S.kingKillActive = false; return end
     S.kingKillActive = true
+    S.enlargeTarget(t)
     S.applyKillMove(hrp)
     if tick() - S.kingKillLastAttack >= 0.05 then
         S.kingKillLastAttack = tick()
@@ -1295,6 +1367,7 @@ S.updateDualTool = function()
     end
 end
 
+-- PETS / getOwnedPets / eatEgg / giftEggs / petShop / antiLag / tex / cull / hide 同 v38
 S.PETS_DATA = {
     ["Omega Overlord"]={repSpeed=20},["Swift Samurai"]={repSpeed=15},
     ["Powercore Hound"]={strength=25,durability=15},["Titanium Hydra"]={rebirth=2},
@@ -1454,7 +1527,6 @@ S.buyPet = function(name)
     return true
 end
 
--- 隐藏/纹理/AntiLag/Cull 略（与 v37 相同）
 S.hidePart = function(m)
     if not m or not m.Parent then return end
     for _, p in ipairs(m:GetDescendants()) do
@@ -1737,6 +1809,7 @@ S.runAdaptive = function()
         if S.ui.rateBox then S.ui.rateBox.Text = tostring(newRate) end
     end
 end
+
 -- ============================================================
 -- 任务注册
 -- ============================================================
@@ -1869,7 +1942,7 @@ S.registerTask({ id="boss", priority=190,
 
 S.registerTask({ id="kingKill", priority=180,
     enabled=function() return S.autoKingKill and not S.scriptPaused and not (S.autoBoss and S.isAnyBossAlive()) end,
-    onDisable=function() S.kingKillTarget = nil; S.kingKillActive = false end,
+    onDisable=function() S.kingKillTarget = nil; S.kingKillActive = false; S.restoreAllEnlarged() end,
     tick=function() S.runKingKillTick() end,
 })
 
@@ -1894,6 +1967,7 @@ S.registerTask({ id="kill", priority=150,
         end
         S.killTarget = nil; S.toolOwnedByKill = false; S.dualCurrentMode = "punch"
         S.setRebirthPause("kill", false)
+        S.restoreAllEnlarged()
         S.applyPetPreset("train")
     end,
     tick=function() S.runKillTick() end,
@@ -2000,7 +2074,7 @@ S.registerTask({ id="teleport", priority=100,
     end,
 })
 
--- ★ 循环传送严格顺序
+-- ★ 单点传送（不是循环）
 S.registerTask({ id="teleportLoop", priority=95,
     enabled=function()
         return S.teleportLoopEnabled and not S.scriptPaused and not S.autoTeleport
@@ -2016,12 +2090,11 @@ S.registerTask({ id="teleportLoop", priority=95,
         end
     end,
     tick=function()
-        if tick() - S.teleportLoopLastAt >= 1 then
+        -- ★ 只在每个点停 0.8 秒，然后传下一个；但这版是"单点传送"，不循环
+        -- 用户意思是：单点反复传送（循环到同一个点），而不是顺序多个点
+        if tick() - S.teleportLoopLastAt >= 0.8 then
             S.teleportLoopLastAt = tick()
-            local idx = S.teleportLoopIndex
-            if not idx or idx < 1 then idx = 1 end
-            if idx > #S.TELEPORTS then idx = 1 end
-            local tp = S.TELEPORTS[idx]
+            local tp = S.TELEPORTS[S.teleportLoopIndex]  -- 用户指定的单点
             if tp then
                 local hrp = S.cache.hrp
                 if hrp then
@@ -2030,8 +2103,6 @@ S.registerTask({ id="teleportLoop", priority=95,
                     hrp.AssemblyAngularVelocity = V3(0,0,0)
                 end
                 S.updateGravityLock(tp.pos)
-                S.teleportLoopIndex = idx + 1
-                if S.teleportLoopIndex > #S.TELEPORTS then S.teleportLoopIndex = 1 end
             end
         end
     end,
@@ -2100,8 +2171,7 @@ S.registerTask({ id="tool", priority=79,
             and not S.scriptPaused and S.machineState.mode ~= "machine"
     end,
     tick=function()
-        local interval = 0.1
-        if tick() - S.lastToolCheck < interval then return end
+        if tick() - S.lastToolCheck < 0.1 then return end
         S.lastToolCheck = tick()
         local sel = {}
         if S.toolPushups then table.insert(sel, S.TOOL_KW.pushups) end
@@ -2131,7 +2201,6 @@ S.registerTask({ id="tool", priority=79,
     end,
 })
 
--- ★ 锻炼：每次重新获取 event
 S.registerTask({ id="train", priority=60,
     enabled=function()
         return (S.autoTrain or S.fastTrain) and not S.kingKillActive
@@ -2144,22 +2213,12 @@ S.registerTask({ id="train", priority=60,
         local count = math.floor(S.trainAccum)
         if count <= 0 then return end
         S.trainAccum = S.trainAccum - count
-        local MAX_PER_TICK = 400
-        if count > MAX_PER_TICK then
-            S.trainAccum = S.trainAccum + (count - MAX_PER_TICK)
-            count = MAX_PER_TICK
-        end
+        if count > 400 then S.trainAccum = S.trainAccum + (count - 400); count = 400 end
         local ev = S.getMuscleEvent()
-        if not ev then
-            S.muscleEventRef = nil
-            ev = S.getMuscleEvent()
-        end
+        if not ev then S.muscleEventRef = nil; ev = S.getMuscleEvent() end
         if not ev then return end
-        if ev.Parent ~= LP then
-            S.muscleEventRef = nil
-            ev = S.getMuscleEvent()
-            if not ev then return end
-        end
+        if ev.Parent ~= LP then S.muscleEventRef = nil; ev = S.getMuscleEvent() end
+        if not ev then return end
         task.spawn(function()
             pcall(function()
                 for i = 1, count do
@@ -2298,8 +2357,21 @@ S.updateGlobal = function(dt)
     if S.adaptiveEnabled and (S.fastTrain or S.autoTrain) then
         pcall(S.runAdaptive)
     end
-    -- CFrame 优先级清理
     if tick() - (S._cfSetAt or 0) > 0.15 then S._cfPriority = 0 end
+    -- ★ 关键修复：只在真正需要时禁用移动；一旦没有任何阻止移动的任务，恢复 WalkSpeed
+    local blockMove = S.killEnabled or S.autoTeleport or S.kingKillActive
+        or S.teleportLoopEnabled or S.machineState.enabled or S._bossActive
+    local hum = S.cache.hum
+    if hum then
+        if blockMove then
+            if hum.WalkSpeed ~= 0 then hum.WalkSpeed = 0 end
+        else
+            -- 恢复 WalkSpeed（防止关闭后无法移动）
+            if hum.WalkSpeed == 0 then
+                hum.WalkSpeed = S._origWalkSpeed or 16
+            end
+        end
+    end
 end
 
 S.onHeartbeat = function(dt)
@@ -2363,7 +2435,7 @@ S.onHeartbeat = function(dt)
 end
 
 -- ============================================================
--- 配置
+-- 配置（带继承）
 -- ============================================================
 S.saveConfig = function()
     if S.destroyed or type(writefile) ~= "function" then return end
@@ -2413,10 +2485,8 @@ S.saveConfig = function()
         emergencyRejoin=S.emergencyRejoin, fontScale=S.fontScale,
         UIState_pillPos=S.UIState.pillPos,
         petPresetAutoSwitch=S.petPreset.autoSwitch,
-        petPresetTrain=S.petPreset.train,
-        petPresetRebirth=S.petPreset.rebirth,
-        petPresetKill=S.petPreset.kill,
-        petPresetBoss=S.petPreset.boss,
+        petPresetTrain=S.petPreset.train, petPresetRebirth=S.petPreset.rebirth,
+        petPresetKill=S.petPreset.kill, petPresetBoss=S.petPreset.boss,
         antiAfkInterval=S.antiAfkInterval,
         configVersion=VERSION,
     }
@@ -2424,14 +2494,7 @@ S.saveConfig = function()
     if ok and enc then pcall(writefile, CONFIG_FILE, enc) end
 end
 
-S.loadConfig = function()
-    if type(isfile) ~= "function" or type(readfile) ~= "function" then return end
-    local exists = false; pcall(function() exists = isfile(CONFIG_FILE) end)
-    if not exists then return end
-    local ok, content = pcall(readfile, CONFIG_FILE)
-    if not ok or type(content) ~= "string" then return end
-    local ok2, data = pcall(HttpService.JSONDecode, HttpService, content)
-    if not ok2 or type(data) ~= "table" then return end
+S.applyConfigData = function(data)
     local function b(k, f) if type(data[k]) == "boolean" then return data[k] end return f end
     local function n(k, f, lo, hi)
         local v = tonumber(data[k]); if not v then return f end
@@ -2512,6 +2575,32 @@ S.loadConfig = function()
     S.antiAfkInterval=n("antiAfkInterval",S.antiAfkInterval,60,1140)
 end
 
+S.loadConfig = function()
+    -- ★ 优先读自己；没有就读老版本
+    local function tryLoad(file)
+        if type(isfile) ~= "function" or type(readfile) ~= "function" then return nil end
+        local exists = false
+        pcall(function() exists = isfile(file) end)
+        if not exists then return nil end
+        local ok, content = pcall(readfile, file)
+        if not ok or type(content) ~= "string" then return nil end
+        local ok2, data = pcall(HttpService.JSONDecode, HttpService, content)
+        if not ok2 or type(data) ~= "table" then return nil end
+        return data
+    end
+    local data = tryLoad(CONFIG_FILE)
+    if not data then
+        for _, oldFile in ipairs(OLD_CONFIGS) do
+            data = tryLoad(oldFile)
+            if data then
+                print("[MK v39] 从旧版本继承配置：" .. oldFile)
+                break
+            end
+        end
+    end
+    if data then S.applyConfigData(data) end
+end
+
 -- ============================================================
 -- UI 构建
 -- ============================================================
@@ -2522,6 +2611,56 @@ S.buildUI = function()
         ZIndexBehavior=ENUM.ZIndexBehavior.Sibling, DisplayOrder=99999,
     }, PG)
     S.ui.screen = screen
+
+    -- ★ 确认弹窗（关闭脚本 / 删除配置）
+    S.showConfirm = function(title, desc, onYes, onNo)
+        if S.UIState.confirmOpen then return end
+        S.UIState.confirmOpen = true
+        local overlay = S.create("Frame", {
+            Name="ConfirmOverlay", Size=UD2(1,0,1,0),
+            BackgroundColor3=C3(0,0,0), BackgroundTransparency=0.5,
+            BorderSizePixel=0, ZIndex=2000, Active=true,
+        }, screen)
+        local box = S.create("Frame", {
+            AnchorPoint=V2(0.5, 0.5), Position=UD2(0.5, 0, 0.5, 0),
+            Size=UDO(400, 200), BackgroundColor3=TH.Surface,
+            BorderSizePixel=0, ZIndex=2001,
+        }, overlay)
+        S.corner(box, 12); S.stroke(box, TH.Accent, 2, 0.1)
+        S.create("TextLabel", {
+            BackgroundTransparency=1, Position=UDO(0,20), Size=UD2(1,0,0,32),
+            Font=ENUM.Font.GothamBold, Text=title or "确认",
+            TextColor3=TH.Text, TextSize=20, TextXAlignment=ENUM.TextXAlignment.Center,
+        }, box)
+        S.create("TextLabel", {
+            BackgroundTransparency=1, Position=UDO(20,60), Size=UD2(1,-40,0,60),
+            Font=ENUM.Font.GothamMedium, Text=desc or "",
+            TextColor3=TH.TextDim, TextSize=14, TextWrapped=true,
+            TextXAlignment=ENUM.TextXAlignment.Center,
+        }, box)
+        local yesBtn = S.create("TextButton", {
+            Size=UDO(160,44), Position=UDO(30, 140),
+            BackgroundColor3=TH.Danger, BorderSizePixel=0,
+            Font=ENUM.Font.GothamBold, Text="确认", TextColor3=TH.OnAccent, TextSize=16,
+        }, box)
+        S.corner(yesBtn, 8)
+        local noBtn = S.create("TextButton", {
+            Size=UDO(160,44), Position=UDO(210, 140),
+            BackgroundColor3=TH.SurfaceAlt, BorderSizePixel=0,
+            Font=ENUM.Font.GothamBold, Text="取消", TextColor3=TH.Text, TextSize=16,
+        }, box)
+        S.corner(noBtn, 8)
+        S.track(yesBtn.MouseButton1Click:Connect(function()
+            pcall(function() overlay:Destroy() end)
+            S.UIState.confirmOpen = false
+            if onYes then onYes() end
+        end))
+        S.track(noBtn.MouseButton1Click:Connect(function()
+            pcall(function() overlay:Destroy() end)
+            S.UIState.confirmOpen = false
+            if onNo then onNo() end
+        end))
+    end
 
     local main = S.create("Frame", {
         Name="Main", AnchorPoint=V2(0,0),
@@ -2539,7 +2678,7 @@ S.buildUI = function()
     S.corner(titleBar, 12)
     S.create("TextLabel", {
         BackgroundTransparency=1, Position=UDO(18,0), Size=UD2(1,-160,1,0),
-        Font=ENUM.Font.GothamBold, Text="肌肉之王自动化 v38",
+        Font=ENUM.Font.GothamBold, Text="肌肉之王自动化 v39",
         TextColor3=TH.Text, TextSize=18, TextXAlignment=ENUM.TextXAlignment.Left,
     }, titleBar)
     local minBtn = S.create("TextButton", {
@@ -3031,17 +3170,17 @@ S.buildUI = function()
             hrp.CFrame = cf; S.notify("已传送", 2)
         end)
         divider(p)
-        sectionLabel(p, "循环传送点（严格顺序）")
-        S.ui.loopToggle = addToggle(p, "启用循环传送", S.teleportLoopEnabled, function(v)
+        sectionLabel(p, "★ 单点传送（持续锁定同一坐标）")
+        S.ui.loopToggle = addToggle(p, "启用单点传送", S.teleportLoopEnabled, function(v)
             S.teleportLoopEnabled = v
             if v then
                 S.autoTeleport = false
                 if S.ui.teleToggle then S.ui.teleToggle.set(false) end
             end
-        end, "按顺序依次传送，每个 1 秒")
+        end, "持续锁定到选择的单个坐标")
         local tpNames = {}
         for _, t in ipairs(S.TELEPORTS) do table.insert(tpNames, t.name) end
-        addDropdown(p, "起始点", tpNames, S.TELEPORTS[S.teleportLoopIndex] and S.TELEPORTS[S.teleportLoopIndex].name or tpNames[1],
+        addDropdown(p, "目标坐标", tpNames, S.TELEPORTS[S.teleportLoopIndex] and S.TELEPORTS[S.teleportLoopIndex].name or tpNames[1],
             function(v)
                 for i, t in ipairs(S.TELEPORTS) do
                     if t.name == v then S.teleportLoopIndex = i; break end
@@ -3096,7 +3235,7 @@ S.buildUI = function()
         local p = pages.kill
         sectionLabel(p, "全图杀戮")
         S.ui.killToggle = addToggle(p, "开启全图杀戮", S.killEnabled, function(v) S.killEnabled = v end,
-            "Boss 存在时自动暂停")
+            "Boss 存在时自动暂停；开启时放大敌人方便打中")
         divider(p)
         sectionLabel(p, "善恶过滤")
         addToggle(p, "只杀好人", S.killGoodOnly, function(v) S.killGoodOnly = v end)
@@ -3113,7 +3252,7 @@ S.buildUI = function()
         addToggle(p, "杀戮时切换训练工具", S.dualEnabled, function(v) S.dualEnabled = v end)
         addToggle(p, "自动击杀其他肌肉之王", S.autoKingKill, function(v)
             S.autoKingKill = v
-            if not v then S.kingKillTarget = nil; S.kingKillActive = false end
+            if not v then S.kingKillTarget = nil; S.kingKillActive = false; S.restoreAllEnlarged() end
         end, "只看打不打得过")
     end
 
@@ -3188,9 +3327,58 @@ S.buildUI = function()
             end},
         })
         divider(p)
-        sectionLabel(p, "★ 自动换宠（4 预设）")
+        sectionLabel(p, "★ 自动换宠（4 预设，快速切换）")
         addToggle(p, "启用自动换宠", S.petPreset.autoSwitch, function(v) S.petPreset.autoSwitch = v end,
-            "执行不同任务时切换宠物")
+            "执行不同任务时切换宠物（快速，无延迟）")
+
+        -- ★ 显示当前配置详情
+        local presetViewer = S.create("Frame", {
+            Size=UD2(1,0,0,180), BackgroundColor3=TH.Surface,
+            BorderSizePixel=0,
+        }, p)
+        S.corner(presetViewer, 8); S.stroke(presetViewer, TH.Border, 1, 0.5)
+        S.padding(presetViewer, 10, 10, 12, 12)
+        local pvLayout = S.create("UIListLayout", {
+            Padding = UDim.new(0, 4),
+            SortOrder=ENUM.SortOrder.LayoutOrder,
+        }, presetViewer)
+
+        local function refreshPresetViewer()
+            for _, c in ipairs(presetViewer:GetChildren()) do
+                if c:IsA("TextLabel") then c:Destroy() end
+            end
+            local order = 0
+            local function makeLine(text, color)
+                order = order + 1
+                local lbl = S.create("TextLabel", {
+                    Size=UD2(1,0,0,18), BackgroundTransparency=1, LayoutOrder=order,
+                    Font=ENUM.Font.GothamMedium, Text=text, TextColor3=color or TH.Text,
+                    TextSize=13, TextXAlignment=ENUM.TextXAlignment.Left,
+                    TextTruncate=ENUM.TextTruncate.AtEnd,
+                }, presetViewer)
+                return lbl
+            end
+            makeLine("【当前配置详情】", TH.Accent)
+            local function describe(key, label)
+                local p_ = S.petPreset[key]
+                if not p_ or #p_ == 0 then
+                    makeLine(label.."：空", TH.TextMuted)
+                else
+                    local parts = {}
+                    for _, e in ipairs(p_) do
+                        table.insert(parts, string.format("%s×%d", S.translatePet(e.name) or e.name, e.count or 1))
+                    end
+                    makeLine(label.."："..table.concat(parts, ", "), TH.Text)
+                end
+            end
+            describe("train", "锻炼")
+            describe("rebirth", "重生")
+            describe("kill", "杀戮")
+            describe("boss", "Boss")
+        end
+        refreshPresetViewer()
+        S.ui.refreshPresetViewer = refreshPresetViewer
+
         local function savePreset(key, label)
             local names = {}
             for _, p_ in ipairs(S.getEquippedPetNames()) do
@@ -3202,6 +3390,7 @@ S.buildUI = function()
             end
             S.petPreset[key] = names
             S.petPreset.activeType = nil
+            refreshPresetViewer()
             local txt = {}
             for _, e in ipairs(names) do
                 table.insert(txt, string.format("%s×%d", S.translatePet(e.name) or e.name, e.count))
@@ -3216,6 +3405,18 @@ S.buildUI = function()
             S.applyPetPreset(key)
             S.notify("已应用"..label, 3)
         end
+        local function deletePreset(key, label)
+            if not S.petPreset[key] or #S.petPreset[key] == 0 then
+                S.notify(label.."为空", 3); return
+            end
+            S.showConfirm("删除配置", "确定删除 "..label.." 配置？此操作不可撤销。", function()
+                S.petPreset[key] = {}
+                S.petPreset.activeType = nil
+                refreshPresetViewer()
+                S.notify(label.."已删除", 3)
+            end)
+        end
+
         addActionRow(p, {
             {label="保存→锻炼", onClick=function() savePreset("train", "锻炼") end},
             {label="应用→锻炼", color=TH.Accent2, onClick=function() applyPreset("train", "锻炼") end},
@@ -3232,6 +3433,15 @@ S.buildUI = function()
             {label="保存→Boss", onClick=function() savePreset("boss", "Boss") end},
             {label="应用→Boss", color=TH.Accent2, onClick=function() applyPreset("boss", "Boss") end},
         })
+        addActionRow(p, {
+            {label="删除→锻炼", color=TH.Warning, onClick=function() deletePreset("train", "锻炼") end},
+            {label="删除→重生", color=TH.Warning, onClick=function() deletePreset("rebirth", "重生") end},
+        })
+        addActionRow(p, {
+            {label="删除→杀戮", color=TH.Warning, onClick=function() deletePreset("kill", "杀戮") end},
+            {label="删除→Boss", color=TH.Warning, onClick=function() deletePreset("boss", "Boss") end},
+        })
+        addButton(p, "刷新配置查看", function() refreshPresetViewer(); S.notify("已刷新", 2) end)
     end
 
     -- Boss 页
@@ -3409,7 +3619,7 @@ S.buildUI = function()
         end
     end))
 
-    -- ★ 药丸（整块拖动，短按展开）
+    -- 药丸
     local pillFrame = S.create("Frame", {
         Name="Pill", AnchorPoint=V2(0.5, 0.5),
         Position=S.deserializePos(S.UIState.pillPos, UD2(0.5, 0, 0.18, 0)),
@@ -3424,7 +3634,7 @@ S.buildUI = function()
     }, pillFrame)
     S.create("TextLabel", {
         BackgroundTransparency=1, Position=UDO(48,0), Size=UD2(1,-48,1,0),
-        Font=ENUM.Font.GothamBold, Text="肌肉之王 v38",
+        Font=ENUM.Font.GothamBold, Text="肌肉之王 v39",
         TextColor3=TH.Text, TextSize=15,
     }, pillFrame)
 
@@ -3461,7 +3671,12 @@ S.buildUI = function()
     S.track(pillBtn.MouseButton1Click:Connect(function()
         main.Visible = false; pillFrame.Visible = true
     end))
-    S.track(closeBtn.MouseButton1Click:Connect(function() S.destroy() end))
+    -- ★ 关闭脚本二次确认
+    S.track(closeBtn.MouseButton1Click:Connect(function()
+        S.showConfirm("关闭脚本", "确定要完全关闭脚本吗？所有功能会停止。", function()
+            S.destroy()
+        end)
+    end))
     if S.UIState.pillPos then
         pillFrame.Position = S.deserializePos(S.UIState.pillPos, UD2(0.5, 0, 0.18, 0))
     end
@@ -3779,8 +3994,14 @@ S.destroy = function()
     for _, c in ipairs(S.conns) do pcall(function() c:Disconnect() end) end
     table.clear(S.conns)
     S.cancelAllThreads()
+    S.restoreAllEnlarged()
     pcall(S.releaseGravityLock)
     pcall(function() Workspace.Gravity = S.originalGravity end)
+    -- ★ 恢复玩家移动
+    pcall(function()
+        local hum = S.cache.hum
+        if hum then hum.WalkSpeed = S._origWalkSpeed or 16 end
+    end)
     pcall(S.disableAntiLag); pcall(S.disableRenderCull)
     pcall(S.restoreHiddenPets); pcall(S.restoreHiddenMachines)
     pcall(S.disableTex); pcall(S.restoreHiddenUI)
@@ -3831,11 +4052,19 @@ S.track(LP.CharacterAdded:Connect(function()
     S.bossDeathPos = nil
     S.petPreset.activeType = nil
     S.trainAccum = 0
+    table.clear(S._enlargedTargets)
     table.clear(S.renderCull.hidden)
     table.clear(S.petHider.own); table.clear(S.petHider.all); table.clear(S.petHider.machines)
     task.wait(0.5)
     pcall(S.setupGravityLock)
     if S.hideUIEnabled then pcall(S.hideAllOtherUI) end
+    -- ★ 恢复新角色移动速度（关键！防止重生后被锁死）
+    pcall(function()
+        local hum = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
+        if hum then
+            hum.WalkSpeed = S._origWalkSpeed or 16
+        end
+    end)
 end))
 
 S.track(LP.AncestryChanged:Connect(function()
@@ -3849,8 +4078,12 @@ end))
 task.spawn(function()
     task.wait(1)
     pcall(S.setupGravityLock)
+    pcall(function()
+        local hum = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
+        if hum then S._origWalkSpeed = hum.WalkSpeed end
+    end)
 end)
 
 S.track(HB:Connect(S.onHeartbeat))
 _G[PLUGIN_ID] = {version=VERSION, cleanup=S.destroy}
-S.notify("肌肉之王自动化 v38 已加载", 4)
+S.notify("肌肉之王自动化 v39 已加载（继承 v38 配置）", 4)
