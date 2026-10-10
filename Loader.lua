@@ -3,7 +3,7 @@
 --  MKUltraHUB -- GENERATED BUNDLE. DO NOT EDIT.
 --  Source of truth: src\**\*.luau   Builder: tools\bundle.ps1
 --  Modules: 68   Entry: main
---  Generated: 2026-10-10 22:39:33
+--  Generated: 2026-10-10 23:16:18
 -- ===========================================================================
 
 local __modules = {}
@@ -785,6 +785,10 @@ BossInfo.EVENT_GROUP = "event"
 export type EventBoss = {
 	key: string,
 	label: string,
+	-- Fixed hover height for THIS boss. They are not one number: the user's
+	-- numbers are 50 / 120 / 47 / 50 (Frankenbrute needs nearly twice the height
+	-- of the rest), so the value belongs to the entry, not to a shared setting.
+	hover: number,
 	names: { string },
 	keywords: { string },
 }
@@ -793,24 +797,28 @@ local EVENTS: { EventBoss } = {
 	{
 		key = "grimReaper",
 		label = "死神 Grim Reaper",
+		hover = 50,
 		names = { "Grim Reaper", "GrimReaper" },
 		keywords = { "grimreaper", "grim reaper", "reaper", "死神" },
 	},
 	{
 		key = "frankenBrute",
 		label = "科学怪人 Frankenbrute",
+		hover = 120,
 		names = { "Frankenbrute", "FrankenBrute", "Franken Brute" },
 		keywords = { "frankenbrute", "franken brute", "franken", "科学怪人" },
 	},
 	{
 		key = "scarecrowColossus",
 		label = "稻草人 Scarecrow Colossus",
+		hover = 24,
 		names = { "Scarecrow Colossus", "ScarecrowColossus" },
 		keywords = { "scarecrowcolossus", "scarecrow", "稻草人" },
 	},
 	{
 		key = "pumpkinTitan",
 		label = "南瓜泰坦 Pumpkin Titan",
+		hover = 50,
 		names = { "Pumpkin Titan", "PumpkinTitan" },
 		keywords = { "pumpkintitan", "pumpkin", "南瓜" },
 	},
@@ -823,13 +831,18 @@ BossInfo.EVENTS = EVENTS
 BossInfo.EVENT_ID = "BossId"
 
 --[[
-	How far above an EVENT boss the fight hovers.
+	The NORMAL group's fixed hover height: every arena boss uses 70 studs.
 
-	All four are small next to the arena bosses (7K-8.5K HP versus 63K), and the
-	user's own number for every one of them is 55 studs -- not the 70 the arena
-	bosses need. `boss.eventHoverHeight` is the live setting; this is its default.
+	Also the fallback for an event boss whose entry cannot be found (a save file
+	naming a boss this build does not know), so a missing entry degrades to a
+	sane number instead of dropping the fight to the ground.
+
+	All of these are fixed numbers on purpose: they are geometry facts about each
+	rig, not preferences, and a slider that could break the punch reach was worse
+	than useless.
 ]]
-BossInfo.EVENT_HOVER = 55
+BossInfo.NORMAL_HOVER = 70
+BossInfo.EVENT_HOVER = 50
 
 function BossInfo.fixed(): { { id: string, rarity: string } }
 	return FIXED
@@ -1224,10 +1237,20 @@ local SCHEMA: { Spec } = {
 	bool("boss.auto", false),
 	bool("boss.sizeEnabled", false),
 	num("boss.sizeMul", 5, 1, 20),
-	-- How far above the boss the fight hovers. 70 is the legacy constant and the
-	-- value the user's own reference implementation uses; it is exposed because
-	-- it is the one number that decides whether the punches land.
-	num("boss.hoverHeight", 70, 1, 200),
+	--[[
+		HOW HIGH THE FIGHT HOVERS -- now FIXED, not a setting.
+
+		The number is geometry, not preference: the arena bosses all use 70 studs
+		(`BossInfo.NORMAL_HOVER`) and each event boss carries its own (see
+		core/BossInfo's EVENTS table). A slider could break the punch reach, and
+		the one that existed defaulted to a value the event bosses could not use.
+
+		The key is kept as a LIVE key (declared so validation and the unknown-key
+		check know it, never read, never written) purely so a config file written
+		by the previous build does not print "unknown key dropped" -- the value in
+		it is ignored.
+	]]
+	liveNum("boss.hoverHeight", BossInfo.NORMAL_HOVER),
 	bool("boss.autoChest", false),
 	num("boss.chestDelay", 3, 0, 30),
 
@@ -1247,7 +1270,9 @@ local SCHEMA: { Spec } = {
 	]]
 	enm("boss.priority", "event", BOSS_PRIORITY),
 	bool("boss.event.enabled", true),
-	num("boss.eventHoverHeight", BossInfo.EVENT_HOVER, 1, 200),
+	-- Superseded: each event boss now carries its own fixed hover height
+	-- (BossInfo.EVENTS). Live key, same reasoning as `boss.hoverHeight` above.
+	liveNum("boss.eventHoverHeight", BossInfo.EVENT_HOVER),
 	--[[
 		AFTER THE LAST EVENT BOSS: hop to a fresh server.
 
@@ -10237,26 +10262,27 @@ local ARRIVE_DISTANCE = 12
 	Hover height above the boss: close enough for the punches to land, high enough
 	that the boss's own attacks mostly miss.
 
-	TWO heights, because the two groups are different sizes. The arena bosses use
-	`boss.hoverHeight` (default 70 -- the legacy constant, and the value the
-	user's own reference implementation uses). Every EVENT boss is smaller (7K-8.5K
-	HP against 63K) and the user's number for all four is 55, which is
-	`boss.eventHoverHeight`.
+	Every one of these is a FIXED number, per boss -- they are geometry facts
+	about the rigs, not preferences:
+
+	    normal arena bosses   70 studs (all six slots)
+	    Grim Reaper           50
+	    Frankenbrute         120   (it is far taller than the other three)
+	    Scarecrow Colossus    24
+	    Pumpkin Titan         50
+
+	The numbers live in core/BossInfo next to the boss they belong to, so adding
+	a boss means adding one entry rather than hunting for a constant here.
 ]]
 local function hoverHeight(store, info)
 	if info ~= nil and info.group == BossInfo.EVENT_GROUP then
-		local eventHeight = tonumber(store:get("boss.eventHoverHeight"))
-		if eventHeight == nil or eventHeight < 1 then
-			return BossInfo.EVENT_HOVER
+		local entry = BossInfo.event(info.eventKey)
+		if entry ~= nil and entry.hover >= 1 then
+			return entry.hover
 		end
-		return eventHeight
+		return BossInfo.EVENT_HOVER
 	end
-
-	local value = tonumber(store:get("boss.hoverHeight"))
-	if value == nil or value < 1 then
-		return 70
-	end
-	return value
+	return BossInfo.NORMAL_HOVER
 end
 
 -- The legacy downward gaze: 45 degrees below the line to the target. See
@@ -20566,15 +20592,7 @@ Page.build = function(kit, page, shell)
 		})
 	end
 	kit:note(rarityCard, "识别不出品级的 Boss 一律算作要打，避免游戏改名后功能静默失效")
-	kit:slider(rarityCard, {
-		label = "普通 Boss 悬停高度（格）",
-		path = "boss.hoverHeight",
-		min = 1,
-		max = 200,
-		default = 70,
-		commitOnly = true,
-		hint = "站在 Boss 上方多少格；打不到就调低一点",
-	})
+	kit:note(rarityCard, "悬停高度固定 70 格（几何写死，不能改）")
 
 	-- -------------------------------------------------------- event group --
 	kit:section(page, "活动 Boss（万圣节 / 圣诞等）")
@@ -20601,15 +20619,18 @@ Page.build = function(kit, page, shell)
 	end
 	kit:note(eventCard, "按顺序击杀：打完一个自动飞下一个；关掉的会被跳过")
 
-	kit:slider(eventCard, {
-		label = "活动 Boss 悬停高度（格）",
-		path = "boss.eventHoverHeight",
-		min = 1,
-		max = 200,
-		default = BossInfo.EVENT_HOVER,
-		commitOnly = true,
-		hint = "四个活动 Boss 都用这个高度，默认 55",
-	})
+	--[[
+		THE FIXED HOVER HEIGHTS, spelled out in the label.
+
+		Each boss's number is geometry about its rig (Frankenbrute is twice the
+		height of the rest, Scarecrow is a small one), so there is no slider: the
+		read-out is here so "why did it hover there" is answerable at a glance.
+	]]
+	local heights = {}
+	for _, entry in ipairs(BossInfo.events()) do
+		table.insert(heights, string.format("%s %d", entry.label:match("^%S+"), entry.hover))
+	end
+	kit:note(eventCard, "悬停高度固定：" .. table.concat(heights, " · ") .. " 格")
 
 	-- ------------------------------------------------------------ the hop --
 	kit:section(page, "活动 Boss 清空后换服")
