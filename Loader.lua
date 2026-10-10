@@ -3,7 +3,7 @@
 --  MKUltraHUB -- GENERATED BUNDLE. DO NOT EDIT.
 --  Source of truth: src\**\*.luau   Builder: tools\bundle.ps1
 --  Modules: 68   Entry: main
---  Generated: 2026-10-10 18:32:40
+--  Generated: 2026-10-10 21:15:36
 -- ===========================================================================
 
 local __modules = {}
@@ -792,6 +792,39 @@ local SCHEMA: { Spec } = {
 	num("train.adaptiveThresh", 30, 10, 120),
 	num("train.adaptiveMax", 5000, 100, 50000),
 	--[[
+		EVENT-ADAPTIVE PACING (the third mode).
+
+		Instead of taking the rate from `train.rate`, it PROBES for the fastest
+		rate the connection will take: climb while the measured latency stays
+		under `train.eventPingTarget`, halve and hold on the first breach.
+
+		It deliberately masks the other two controls: `train.adaptive` is ignored
+		while this is on (the frame rate is not what is being adapted to), and the
+		manual rate box is locked -- a number the user keeps editing while the
+		controller owns the rate is exactly the "抢线" the user reported.
+	]]
+	bool("train.eventAdaptive", false),
+	num("train.eventPingTarget", 150, 40, 1000),
+	--[[
+		The rate the pacing layer actually resolved this frame, plus why.
+
+		LIVE: it is a statement about right now. With three pacing modes feeding
+		one number, "why is it sending at 40/s when I typed 900" is otherwise
+		unanswerable without reading the source.
+	]]
+	liveNum("train.effRate", 0),
+	liveStr("train.rateSource", ""),
+	--[[
+		Which hand the tool arbiter is currently holding: "punch" or "train".
+
+		LIVE and shared through the store because TWO subsystems write the same
+		hand: the tool arbiter equips the training tool, and Combat.punch equips
+		the glove on every punch. Without one agreed flag the glove (re-equipped
+		up to 120x/s) always won and training never got a window -- which is the
+		"切换拳套的速度远远超过切换锻炼工具的速度" the user reported.
+	]]
+	liveStr("train.dualTool", "punch"),
+	--[[
 		The resolved arbitration depth, published by game/Train for the UI.
 
 		LIVE, not persisted: it describes what is happening right now (which rung
@@ -831,6 +864,29 @@ local SCHEMA: { Spec } = {
 	str("kill.singleName", ""),
 	bool("kill.approach", true),
 	num("kill.range", 400, 20, 2000),
+	--[[
+		HOW LONG EACH HAND KEEPS THE TOOL ("两两齐平").
+
+		Training and punching cannot both hold the hand, so with training enabled
+		during combat the hand alternates. The bug this replaces was a pacing
+		asymmetry, not a missing feature: the alternation flipped every 0.05 s
+		while the glove was ALSO re-equipped on every punch, so the training tool
+		never stayed on long enough to register a rep. Both halves now hold for
+		the same `kill.dualInterval` seconds.
+	]]
+	num("kill.dualInterval", 0.6, 0.1, 3),
+	--[[
+		THE OVERHEAD APPROACH.
+
+		A punch thrown from the target's own height flies over its shoulder --
+		the boss fight never had that problem because it hovers above the boss and
+		looks DOWN at it. `kill.hoverHeight` gives the kill loop the same shape,
+		with a deliberately small default: the target still has to be inside the
+		game's punch reach, and for a player-sized hitbox that is a body height,
+		not the boss's 70 studs (which is `boss.hoverHeight`).
+	]]
+	num("kill.hoverHeight", 12, 1, 200),
+	bool("kill.lookDown", true),
 	bool("kill.targetSizeEnabled", false),
 	num("kill.targetSizeMul", 5, 1, 20),
 
@@ -851,6 +907,10 @@ local SCHEMA: { Spec } = {
 	bool("boss.auto", false),
 	bool("boss.sizeEnabled", false),
 	num("boss.sizeMul", 5, 1, 20),
+	-- How far above the boss the fight hovers. 70 is the legacy constant and the
+	-- value the user's own reference implementation uses; it is exposed because
+	-- it is the one number that decides whether the punches land.
+	num("boss.hoverHeight", 70, 1, 200),
 	bool("boss.autoChest", false),
 	num("boss.chestDelay", 3, 0, 30),
 
@@ -859,8 +919,19 @@ local SCHEMA: { Spec } = {
 	num("size.selfMul", 3, 1, 20),
 
 	-- performance ------------------------------------------------------------
+	--[[
+		`perf.antiLag` is the master switch; the three below say WHAT it does.
+
+		They exist because the old pass only hid particles and shadows -- "深度防卡顿"
+		did nothing about textures or draw distance, which is most of what makes a
+		big Roblox place heavy. Each is independently reversible, and every object
+		it touches is put back when the switch goes off (see game/Perf).
+	]]
 	bool("perf.antiLag", false),
 	bool("perf.disabled", false),
+	bool("perf.removeEffects", true),
+	bool("perf.removeTextures", true),
+	bool("perf.cull", true),
 
 	-- rejoin -----------------------------------------------------------------
 	bool("rejoin.enabled", false),
@@ -915,6 +986,12 @@ local SCHEMA: { Spec } = {
 	-- "fast training" exists for, while turning it on puts the channel behind a
 	-- real token bucket with visible drop/penalty stats.
 	bool("cfg.trainThrottle", false),
+	-- How often the session's settings are written to disk, in seconds. The user's
+	-- requirement is "every 10 seconds, and once immediately when the script is
+	-- closed" -- the close-side save already lives in `session.stop`, and this is
+	-- the periodic half. It is a setting rather than a constant because the write
+	-- is the expensive part and a user on a slow executor may want it rarer.
+	num("cfg.saveSeconds", 10, 3, 300),
 
 	-- ui state ---------------------------------------------------------------
 	num("uiState.widthPct", 45, 30, 100),	num("uiState.heightPct", 52, 30, 100),
@@ -923,8 +1000,30 @@ local SCHEMA: { Spec } = {
 	num("uiState.fontScale", 1, 0.8, 1.5),
 	bool("uiState.formatNum", true),
 	bool("uiState.infoVisible", false),
+	--[[
+		Should collapsing the main window also hide the info panel?
+
+		Default OFF: the panel is an overlay whose whole point is to be readable
+		while the main window is out of the way (that is what minimising and the
+		pill are for). The user's own wording is the spec: the panel "does not
+		disappear with the main panel's minimise/pill, unless the player closed it
+		themselves". The switch exists so the opposite is one click away instead
+		of an argument.
+	]]
+	bool("uiState.infoHideWithShell", false),
 	enm("uiState.theme", "light", THEMES),
 	bool("uiState.minimized", false),
+	--[[
+		Bumped once the in-place theme repaint has FINISHED.
+
+		The repaint tweens colours over ~0.4 s, and a second pass re-runs at
+		+0.55 s to catch widgets that were mid-tween. Pages that own colours no
+		remap can reach (the theme page's own selected marker) would otherwise be
+		left holding a colour from the previous palette -- the "仍然残存绿色" the
+		user reported twice. Subscribing to this counter is how a page knows the
+		repaint is over and it may re-assert its own colours.
+	]]
+	liveNum("uiState.themeEpoch", 0),
 	-- The collapsed pill is a window mode exactly like `minimized`, so it lives
 	-- in the store too rather than in a field only the shell can see -- but as a
 	-- LIVE key: a reload always comes back as a normal window, and only the
@@ -2294,6 +2393,169 @@ TrainRate.PER_FRAME = 40
 
 function TrainRate.newState(): State
 	return { tokens = 0 }
+end
+
+--[[
+	EVENT-ADAPTIVE RATE ("根据事件自适应发包").
+
+	The third pacing mode, and the one the user asked for by name: instead of
+	taking the rate from a number the user typed, PROBE for the fastest rate the
+	connection will actually take.
+
+	How it walks:
+	  * start at `startRate`, which is deliberately LOW. The first packets are
+	    the ones that discover the ceiling, so starting high would spike ping
+	    before anything had been measured;
+	  * while the measured latency stays under `pingTarget`, raise the rate
+	    multiplicatively (`step`, a slow +8% a beat) -- this is the "send as fast
+	    as possible" half;
+	  * the moment a sample exceeds the target, OR the transport reports it could
+	    not deliver, cut the rate (`backoff`, a hard -50%) and do not probe again
+	    for `holdSeconds`. Multiplicative increase / multiplicative decrease is
+	    the shape that converges fastest without oscillating, and the hold is
+	    what stops it climbing straight back into the latency it just caused.
+
+	Two deliberate properties:
+
+	  * `ping <= 0` means "no sample yet" and NEVER changes the rate. Roblox
+	    returns 0 for a ping it has not measured, and treating that as "0 ms,
+	    wonderful" would ramp to the cap in a second and flood the remote --
+	    which is exactly the failure this mode exists to avoid.
+	  * the rate is clamped into `[minRate, maxRate]` on every path, so a long
+	    run of increases cannot walk past the ceiling and a bad patch cannot
+	    ratchet the rate to zero and strand it there.
+
+	The caller owns the clock and the sample, so all of it is unit-testable.
+]]
+
+export type AdaptiveOptions = {
+	minRate: number?,
+	maxRate: number?,
+	pingTarget: number?,
+	step: number?,
+	backoff: number?,
+	holdSeconds: number?,
+	-- Deliveries the transport refused since the last update. A non-zero value
+	-- is treated exactly like a latency breach: the wire is telling us to slow
+	-- down, and it is a faster signal than ping.
+	refused: number?,
+}
+
+export type AdaptiveState = {
+	rate: number,
+	holdUntil: number,
+	peak: number,
+	probes: number,
+	backoffs: number,
+	reason: string,
+}
+
+TrainRate.ADAPTIVE_MIN = 10
+TrainRate.ADAPTIVE_START = 40
+TrainRate.ADAPTIVE_STEP = 1.08
+TrainRate.ADAPTIVE_BACKOFF = 0.5
+TrainRate.ADAPTIVE_HOLD = 2
+
+function TrainRate.newAdaptive(startRate: number?): AdaptiveState
+	local start = startRate or TrainRate.ADAPTIVE_START
+	if start < TrainRate.ADAPTIVE_MIN then
+		start = TrainRate.ADAPTIVE_MIN
+	end
+	return {
+		rate = start,
+		holdUntil = 0,
+		peak = start,
+		probes = 0,
+		backoffs = 0,
+		reason = "start",
+	}
+end
+
+local function clampRate(value: number, opts: AdaptiveOptions): number
+	local low = opts.minRate or TrainRate.ADAPTIVE_MIN
+	local high = opts.maxRate or TrainRate.MAX_RATE
+	if low < 0 then
+		low = 0
+	end
+	if high < low then
+		high = low
+	end
+	if value < low then
+		return low
+	end
+	if value > high then
+		return high
+	end
+	return value
+end
+
+--[[
+	Fold one sample into the estimate and return the rate to use from now on.
+]]
+function TrainRate.adaptiveUpdate(
+	state: AdaptiveState,
+	ping: number,
+	now: number,
+	options: AdaptiveOptions?
+): number
+	local opts: AdaptiveOptions = options or {}
+	local target = opts.pingTarget or 150
+	local step = opts.step or TrainRate.ADAPTIVE_STEP
+	local backoff = opts.backoff or TrainRate.ADAPTIVE_BACKOFF
+	local hold = opts.holdSeconds or TrainRate.ADAPTIVE_HOLD
+	local refused = opts.refused or 0
+
+	local breach = refused > 0 or (ping > 0 and target > 0 and ping > target)
+
+	if breach then
+		local factor = if backoff > 0 and backoff < 1 then backoff else TrainRate.ADAPTIVE_BACKOFF
+		state.rate = clampRate(state.rate * factor, opts)
+		state.holdUntil = now + math.max(0, hold)
+		state.backoffs += 1
+		state.reason = if refused > 0 then "refused" else "ping"
+		return state.rate
+	end
+
+	-- No usable sample: hold the current rate rather than inventing a reason to
+	-- change it. See the note above about ping == 0.
+	if ping <= 0 then
+		state.reason = "no-sample"
+		return state.rate
+	end
+
+	if now < state.holdUntil then
+		state.reason = "hold"
+		return state.rate
+	end
+
+	-- Multiplicative increase PLUS one packet a second, so the probe still makes
+	-- progress at the very bottom of the range where +8% is a fraction of a
+	-- packet.
+	local factorUp = if step > 1 then step else TrainRate.ADAPTIVE_STEP
+	state.rate = clampRate(state.rate * factorUp + 1, opts)
+	state.probes += 1
+	state.reason = "ramp"
+	if state.rate > state.peak then
+		state.peak = state.rate
+	end
+	return state.rate
+end
+
+-- The wire refused a payload outside the normal sample cadence. Same response
+-- as a latency breach; kept separate so the caller does not have to fake a ping.
+function TrainRate.adaptivePenalize(state: AdaptiveState, now: number, options: AdaptiveOptions?): number
+	local opts: AdaptiveOptions = options or {}
+	local backoff = opts.backoff or TrainRate.ADAPTIVE_BACKOFF
+	local factor = if backoff > 0 and backoff < 1 then backoff else TrainRate.ADAPTIVE_BACKOFF
+	state.rate = clampRate(state.rate * factor, opts)
+	state.holdUntil = now + (opts.holdSeconds or TrainRate.ADAPTIVE_HOLD)
+	state.backoffs += 1
+	state.reason = "refused"
+	return state.rate
+end
+
+function TrainRate.adaptiveDescribe(state: AdaptiveState): string
+	return string.format("%.0f/s", state.rate)
 end
 
 --[[
@@ -6404,6 +6666,8 @@ function Motion.new(options: Options?)
 		pos = nil,
 		get = nil,
 		look = nil,
+		-- Optional downward gaze added to the look direction; see Motion.apply.
+		lookBias = nil,
 		mode = "hover",
 		anchored = false,
 		frozen = false,
@@ -6447,8 +6711,19 @@ function Motion.setTarget(self, position, getter)
 	end
 end
 
-function Motion.setLook(self, look)
+--[[
+	Where to face, and how far to tilt the gaze downward.
+
+	`bias` is optional: pass Vector3.new(0, -1, 0) for the legacy boss-style
+	45-degree downward gaze (see Motion.apply). Omitting it leaves whatever the
+	current hold was set to, so a caller that only re-aims the position does not
+	silently straighten the character out.
+]]
+function Motion.setLook(self, look, bias)
 	self.look = look
+	if bias ~= nil then
+		self.lookBias = if typeof(bias) == "Vector3" then bias else nil
+	end
 end
 
 --[[
@@ -6472,6 +6747,7 @@ function Motion.begin(self, options): boolean
 	self.pos = opts.pos
 	self.get = opts.get
 	self.look = opts.look
+	self.lookBias = opts.lookBias
 	self.mode = mode
 
 	local wantsFreeze = opts.freeze
@@ -6571,7 +6847,36 @@ function Motion.apply(self, now: number): boolean
 
 	local cf
 	if typeof(self.look) == "Vector3" then
-		cf = CFrame.lookAt(target, self.look)
+		--[[
+			THE DOWNWARD BIAS.
+
+			`CFrame.lookAt(pos, target)` with both at the same height aims the
+			character HORIZONTALLY at the target, and a punch fired from that pose
+			travels level -- over the target's shoulder, or into the wall behind
+			them. The legacy boss fight never had that problem because it hovered
+			above the boss and looked down at it:
+
+			    CFrame.lookAt(hoverPos, hoverPos + (flat.Unit + Vector3.new(0,-1,0)).Unit)
+
+			i.e. a 45-degree downward gaze. That tilted gaze is what makes the
+			punch land, so it is a first-class part of the hold rather than
+			something each caller has to fake by placing itself lower.
+
+			`lookBias` is that tilt: added to the unit direction toward the target
+			and re-normalised. A caller that wants the legacy 45 degrees passes
+			Vector3.new(0, -1, 0). When the eye is directly above the target the
+			horizontal component degenerates to zero, and -Z is used instead --
+			exactly as the legacy code did.
+		]]
+		local bias = self.lookBias
+		if typeof(bias) == "Vector3" then
+			local flat = self.look - target
+			flat = Vector3.new(flat.X, 0, flat.Z)
+			local direction = if flat.Magnitude > 0.1 then flat.Unit else Vector3.new(0, 0, -1)
+			cf = CFrame.lookAt(target, target + (direction + bias).Unit)
+		else
+			cf = CFrame.lookAt(target, self.look)
+		end
 	else
 		cf = CFrame.new(target)
 	end
@@ -6795,6 +7100,7 @@ function Motion.finish(self)
 	self.hold:finish()
 	self.get = nil
 	self.look = nil
+	self.lookBias = nil
 	Platforms.remove()
 
 	Motion.release(self)
@@ -6840,6 +7146,7 @@ function Motion.unfreeze(self)
 	self.hold:finish()
 	self.get = nil
 	self.look = nil
+	self.lookBias = nil
 	Platforms.remove()
 	Motion.release(self)
 	self.saved = nil
@@ -7269,6 +7576,22 @@ function Teleport.install(context)
 	local self = Teleport.new(context)
 	local store = context.store
 	local scheduler = context.scheduler
+	--[[
+		BOSS OUTRANKS EVERY MOVEMENT FEATURE.
+
+		The priority order the user gave is: 打 Boss > 全图杀戮 > 单独击杀 /
+		肌肉之王 > 器械. The boss fight owns the body while it runs, so BOTH
+		teleport tasks stand down: the loop used to run regardless ("开了打 Boss
+		再开循环传送，仍然会和打 Boss 抢线") and the muscle-king flight fought
+		the boss flight for the same character -- two `Teleport.walk` calls, each
+		cancelling the other, so neither arrived.
+
+		Injected as a predicate rather than reaching for the Boss service, so this
+		module keeps no dependency on it (Boss is installed after Teleport).
+	]]
+	local isBossFight = context.isBossFight or function()
+		return false
+	end
 
 	scheduler:register({
 		id = "teleportLoop",
@@ -7282,6 +7605,9 @@ function Teleport.install(context)
 				return false
 			end
 			if store:get("kill.enabled") == true then
+				return false
+			end
+			if isBossFight() then
 				return false
 			end
 			return true
@@ -7312,7 +7638,17 @@ function Teleport.install(context)
 		id = "teleport",
 		priority = 80,
 		enabled = function()
-			return store:get("tp.autoMK") == true
+			if store:get("tp.autoMK") ~= true then
+				return false
+			end
+			-- The muscle-king flight is the TRANSPORT for the muscle-king kill,
+			-- not a competitor to the boss: while a boss fight is running the
+			-- boss owns the body, and walking here would cancel its approach
+			-- (and be cancelled by it) every half second.
+			if isBossFight() then
+				return false
+			end
+			return true
 		end,
 		onDisable = function()
 			Teleport.cancel(self)
@@ -8285,7 +8621,20 @@ function Combat.select(self)
 	end
 
 	local lockedId = nil
-	if self.store:get("kill.single") == true then
+	--[[
+		GLOBAL KILL OUTRANKS A HAND-PICKED TARGET.
+
+		Both are inside this one task, and the user's stated priority is
+		"打 Boss > 全图杀戮 > 单独击杀 / 肌肉之王 > 器械". Before this, `kill.single`
+		won whenever it was on, so turning on global-kill and single-target
+		together silently hunted the one named player and ignored the map.
+
+		The named target is therefore only used when global kill is OFF -- i.e.
+		"单独击杀" is the mode you are in when you have not asked for the map.
+		`kill.single` is deliberately NOT forced off, so switching global kill
+		back off returns to the target the user chose.
+	]]
+	if self.store:get("kill.single") == true and self.store:get("kill.enabled") ~= true then
 		lockedId = tostring(self.store:get("kill.singleName") or "")
 	end
 
@@ -8351,6 +8700,25 @@ function Combat.punch(self, left, now)
 	local character = self.character:current()
 	local humanoid = self.character:humanoid()
 	if character == nil or humanoid == nil then
+		return
+	end
+
+	--[[
+		THE TOOL ARBITER'S HALF OF THE HAND.
+
+		A punch re-equips the glove every single time it is thrown, and it is
+		thrown up to 120 times a second (twice per attack tick, plus the boss
+		cadence). The training tool was equipped by a task that flipped once per
+		0.05 s, so the glove won essentially every frame and training never held
+		the tool long enough to register a rep -- the user's "切换拳套的速度远远
+		超过切换锻炼工具的速度，导致锻炼不上".
+
+		While the arbiter owns the hand for training, this function does nothing
+		at all: no equip, no punch, no animation. That is the whole point of
+		alternating -- the training half has to be a real window, not a race the
+		glove wins.
+	]]
+	if self.store:get("train.dualTool") == "train" then
 		return
 	end
 
@@ -8490,16 +8858,39 @@ function Combat.attack(self, target)
 	end
 
 	if self.store:get("kill.approach") ~= false then
-		local direction = myPosition - targetPosition
-		if direction.Magnitude < 0.1 then
-			direction = Vector3.new(0, 0, -1)
-		end
-		local destination = targetPosition + direction.Unit * 1.5
+		--[[
+			THE OVERHEAD APPROACH (the boss fight's geometry).
+
+			The old code stood 1.5 studs BEHIND the target at the target's own
+			height and looked horizontally at it. A punch thrown from that pose
+			travels level and passes over the shoulder of anything shorter than the
+			attacker -- the user's "拳头没打到对面身上". The boss fight never had
+			the problem because it hovers above the boss and looks down at it, so
+			combat uses the same shape:
+
+			    stand `kill.hoverHeight` ABOVE the target
+			    look at it with a downward gaze (`kill.lookDown`)
+
+			The default height is a body (12 studs), NOT the boss's 70: the boss
+			is a huge hitbox and a player is not, so the player target has to stay
+			inside the game's punch reach. The tilt is the part that makes the
+			punch land; the height only has to be "above", not "high".
+		]]
+		local height = tonumber(self.store:get("kill.hoverHeight")) or 12
+		local destination = targetPosition + Vector3.new(0, math.max(1, height), 0)
 		self.motion:setTarget(destination)
 		if not self.motion:isActive() then
-			self.motion:begin({ pos = destination, mode = "combat" })
+			self.motion:begin({
+				pos = destination,
+				mode = "combat",
+				look = targetPosition,
+				lookBias = if self.store:get("kill.lookDown") == false then nil else Vector3.new(0, -1, 0),
+			})
 		end
-		self.motion:setLook(targetPosition)
+		self.motion:setLook(
+			targetPosition,
+			if self.store:get("kill.lookDown") == false then nil else Vector3.new(0, -1, 0)
+		)
 	else
 		local flat = Vector3.new(targetPosition.X - myPosition.X, 0, targetPosition.Z - myPosition.Z)
 		if flat.Magnitude > 0.1 then
@@ -8603,6 +8994,12 @@ end
 ]]
 function Combat.guardPunch(self, now)
 	if self.store:get("cfg.keepPunch") ~= true or not Combat.wantsDamage(self) then
+		self.punchMissingSince = 0
+		return
+	end
+	-- The tool arbiter is holding the training tool on purpose: re-equipping the
+	-- glove here would end the training half of the alternation immediately.
+	if self.store:get("train.dualTool") == "train" then
 		self.punchMissingSince = 0
 		return
 	end
@@ -8977,6 +9374,10 @@ Boss.__index = Boss
 local DETECT_CACHE = 0.5
 local INTERACT_INTERVAL = 0.4
 local TOUCH_TAIL = 0.05
+-- How far above the chest's base part the player is put before interacting.
+-- See Boss.chestTick: the prompt volume is above the rig, and the legacy offset
+-- of 5 studs sat the character on the hinge line where E usually did nothing.
+local CHEST_STAND_HEIGHT = 15
 
 local function selectionOf(store)
 	local selection = {}
@@ -9029,21 +9430,141 @@ function Boss.new(context)
 	return self
 end
 
-local function chestPosition(chest)
+--[[
+	THE CHEST'S BASE PART(S), not just "some base part under the chest".
+
+	The live object is
+
+	    Workspace.BossChest                     (Model)
+	      ["Epic Chest"]     -> EpicChest_Base     (BasePart)
+	      ["品质 Chest"]     -> 品质Chest_Base     (BasePart)
+	      ...
+
+	and the old lookup took `PrimaryPart or the first BasePart found anywhere
+	underneath` -- which on a rigged chest can be a lid hinge or a hinge cover,
+	i.e. a part that is not where the player is supposed to stand. The `_Base`
+	suffix is the game's own name for the part the chest sits on, so it is
+	preferred.
+
+	Several chests exist in the folder at the same time (a live dump shows both
+	"Epic Chest" and "品质 Chest"), so the base parts are collected and the caller
+	picks: a VISIBLE one if exactly one is visible, otherwise the one nearest the
+	player. Choosing the wrong one means teleporting to an empty rig and pressing
+	E forever, which looks exactly like "the chest feature is broken".
+]]
+local function collectBaseParts(chest, out)
 	if chest == nil then
-		return nil
-	end
-	if chest:IsA("Model") then
-		local primary = chest.PrimaryPart or chest:FindFirstChildWhichIsA("BasePart", true)
-		if primary ~= nil then
-			return primary.Position
-		end
-		return nil
+		return
 	end
 	if chest:IsA("BasePart") then
-		return chest.Position
+		table.insert(out, chest)
+		return
 	end
-	return nil
+	local descendants = chest:GetDescendants()
+	for _, object in ipairs(descendants) do
+		if object:IsA("BasePart") and string.sub(object.Name, -5) == "_Base" then
+			table.insert(out, object)
+		end
+	end
+	if #out > 0 then
+		return
+	end
+
+	local primary = chest.PrimaryPart
+	if primary ~= nil then
+		table.insert(out, primary)
+	end
+	-- Direct children before a deep scan: the named chest folders are one level
+	-- down, and a deep scan is what picked up a hinge.
+	for _, object in ipairs(chest:GetChildren()) do
+		if object:IsA("BasePart") then
+			table.insert(out, object)
+		end
+	end
+	for _, object in ipairs(chest:GetChildren()) do
+		local found = object:FindFirstChildWhichIsA("BasePart", true)
+		if found ~= nil then
+			table.insert(out, found)
+		end
+	end
+	if #out == 0 then
+		for _, object in ipairs(descendants) do
+			if object:IsA("BasePart") then
+				table.insert(out, object)
+			end
+		end
+	end
+end
+
+local function partPosition(part)
+	local ok, position = pcall(function()
+		return part.Position
+	end)
+	if not ok or typeof(position) ~= "Vector3" then
+		return nil
+	end
+	return position
+end
+
+local function partVisible(part)
+	local ok, transparency = pcall(function()
+		return part.Transparency
+	end)
+	if not ok or type(transparency) ~= "number" then
+		return true
+	end
+	return transparency < 1
+end
+
+--[[
+	Where to stand: `reference` is the player's current position and is only used
+	to break a tie between two identified chests.
+]]
+local function chestPosition(chest, reference)
+	local parts = {}
+	collectBaseParts(chest, parts)
+	if #parts == 0 then
+		return nil
+	end
+
+	local visible = {}
+	for _, part in ipairs(parts) do
+		local position = partPosition(part)
+		if position ~= nil then
+			table.insert(visible, { part = part, position = position, shown = partVisible(part) })
+		end
+	end
+	if #visible == 0 then
+		return nil
+	end
+
+	local shown = {}
+	for _, entry in ipairs(visible) do
+		if entry.shown then
+			table.insert(shown, entry)
+		end
+	end
+
+	-- Exactly one chest is actually on screen: that is the one the boss dropped.
+	if #shown == 1 then
+		return shown[1].position
+	end
+
+	local pool = if #shown > 0 then shown else visible
+	if typeof(reference) ~= "Vector3" or #pool == 1 then
+		return pool[1].position
+	end
+
+	local best = pool[1].position
+	local bestDistance = (best - reference).Magnitude
+	for index = 2, #pool do
+		local distance = (pool[index].position - reference).Magnitude
+		if distance < bestDistance then
+			bestDistance = distance
+			best = pool[index].position
+		end
+	end
+	return best
 end
 
 --[[
@@ -9132,10 +9653,29 @@ end
 ]]
 local APPROACH_INTERVAL = 0.5
 local ARRIVE_DISTANCE = 12
--- Hover height above the boss: close enough for the punches to land, high enough
--- that the boss's own attacks mostly miss. V1007 hard-coded 70.
-local BOSS_HOVER_HEIGHT = 70
+--[[
+	Hover height above the boss: close enough for the punches to land, high enough
+	that the boss's own attacks mostly miss.
 
+	`boss.hoverHeight`, default 70 -- the legacy constant, and the value the
+	user's own reference implementation uses.
+]]
+local function hoverHeight(store)
+	local value = tonumber(store:get("boss.hoverHeight"))
+	if value == nil or value < 1 then
+		return 70
+	end
+	return value
+end
+
+-- The legacy downward gaze: 45 degrees below the line to the target. See
+-- Motion.apply for why the tilt is what makes a punch land.
+local function lookBias(store)
+	if store:get("kill.lookDown") == false then
+		return nil
+	end
+	return Vector3.new(0, -1, 0)
+end
 function Boss.approach(self, now)
 	local info = self.detect(self)
 	if not info.alive or typeof(info.position) ~= "Vector3" then
@@ -9160,7 +9700,7 @@ function Boss.approach(self, now)
 
 	-- Hover height: close enough for the punches to land, high enough that the
 	-- boss's own attacks mostly miss.
-	local destination = info.position + Vector3.new(0, BOSS_HOVER_HEIGHT, 0)
+	local destination = info.position + Vector3.new(0, hoverHeight(self.store), 0)
 	local distance = (position - destination).Magnitude
 
 	if distance > ARRIVE_DISTANCE and self.teleport ~= nil then
@@ -9173,12 +9713,26 @@ function Boss.approach(self, now)
 		return
 	end
 
-	-- In range: keep the position with the motion hold so a server pull-back is
-	-- corrected rather than leaving the player on the ground.
+	--[[
+		In range: keep the position with the motion hold so a server pull-back is
+		corrected rather than leaving the player on the ground.
+
+		And FACE the boss, tilted down. Without this the hold wrote a CFrame with
+		no rotation at all, so the character hovered above the boss staring
+		straight ahead and the punches went nowhere near it -- the reference
+		script's `CFrame.lookAt(hoverPos, hoverPos + (flat.Unit +
+		Vector3.new(0,-1,0)).Unit)` is exactly the missing half.
+	]]
 	self.motion:setTarget(destination)
 	if not self.motion:isActive() then
-		self.motion:begin({ pos = destination, mode = "boss" })
+		self.motion:begin({
+			pos = destination,
+			mode = "boss",
+			look = info.position,
+			lookBias = lookBias(self.store),
+		})
 	end
+	self.motion:setLook(info.position, lookBias(self.store))
 end
 
 --[[
@@ -9300,17 +9854,38 @@ function Boss.chestTick(self, now)
 	end
 
 	local chest = Workspace:FindFirstChild("BossChest")
-	local position = chestPosition(chest)
+	local root = self.character:requireRoot()
+	local origin = nil
+	if root ~= nil then
+		local ok, position = pcall(function()
+			return root.Position
+		end)
+		if ok and typeof(position) == "Vector3" then
+			origin = position
+		end
+	end
+	local position = chestPosition(chest, origin)
 	if position == nil or position.Y < -100 then
 		return
 	end
+	local stand = position + Vector3.new(0, CHEST_STAND_HEIGHT, 0)
 
 	local current = self.motion:targetPosition()
 	local nearby = self.motion:isActive()
 		and typeof(current) == "Vector3"
-		and (current - position).Magnitude <= 5
+		and (current - stand).Magnitude <= 5
 	if not nearby then
-		self.teleport:walk(position + Vector3.new(0, 5, 0), { mode = "chest", arc = 120 })
+		--[[
+			STAND ~15 STUDS ABOVE THE CHEST'S BASE PART.
+
+			Walking at the chest part itself lands the character INSIDE the rig:
+			the prompt's own reachable volume is above it, and the touch interest
+			the fallback path fires needs the root to be near the lid, not merged
+			with the base. 15 studs is the offset that actually puts the player
+			within prompt range in game (the legacy value of 5 put them at the
+			hinge line, where the E key often did nothing).
+		]]
+		self.teleport:walk(position + Vector3.new(0, CHEST_STAND_HEIGHT, 0), { mode = "chest", arc = 120 })
 	end
 
 	-- Once every 0.4s. Interaction is not rate limited on the wire, but clicking
@@ -10334,6 +10909,8 @@ GameMetrics.__index = GameMetrics
 
 local MEMORY_INTERVAL = 15
 local PING_INTERVAL = 1
+-- See the note in GameMetrics.tick: how often the leaderboard values are re-read.
+local STATS_INTERVAL = 0.25
 
 --[[
 	Rolling-window sizes for the two rate read-outs.
@@ -10383,8 +10960,24 @@ function GameMetrics.tick(self, dt, now)
 		end
 	end
 
-	GameMetrics.trackStrength(self, now)
-	GameMetrics.trackRebirths(self, now)
+	--[[
+		THE LEADERBOARD READS ARE THROTTLED.
+
+		`tick` runs on every frame, and each of these two reads walks the player's
+		children looking for a ValueBase (`PlayerStats.value` does a direct-child
+		lookup AND a `leaderstats` lookup). Three tree walks plus two `tonumber`
+		calls, 60+ times a second, for numbers that move at human speed -- the
+		rebirth counter changes a few times a minute.
+
+		4 Hz is far more than the display needs (the info panel refreshes at
+		5 Hz and the rolling windows are 15 s / 600 s wide) and it takes two
+		thirds of the per-frame object-tree traffic out of the frame loop.
+	]]
+	if now - (self.statsAt or 0) >= STATS_INTERVAL then
+		self.statsAt = now
+		GameMetrics.trackStrength(self, now)
+		GameMetrics.trackRebirths(self, now)
+	end
 end
 
 --[[
@@ -11202,27 +11795,45 @@ end
 __modules["game/Perf"] = function()
 -- (module directive --!nonstrict; the bundle is --!nonstrict)
 --[[
-	Perf -- the anti-lag pass: hide particles, kill shadows, flatten the lighting.
+	Perf -- the anti-lag pass: effects off, textures off, shadows and lighting
+	culled, all of it reversible.
 
-	Ported from Core.Perf in V1007. One behaviour change, and it matters on a big
-	map: the original walked Workspace:GetDescendants() once inside a coroutine,
-	giving up after eight seconds and holding whatever it had managed to disable.
-	On a large place that meant a partially applied optimisation whose extent
-	depended on how busy the machine was.
+	WHY THIS WAS REWRITTEN
+	----------------------
 
-	This version snapshots the list, then walks it with a fixed per-frame budget,
-	so it always finishes and never stalls a frame doing it. The snapshot is taken
-	on the first tick rather than inside enable(), because GetDescendants() on a
-	large place is itself the expensive part.
+	The user's report was blunt: "深度防卡顿功能完全无效". It was not broken --
+	it was too narrow. The pass disabled three things (particles/trails/beams,
+	`CastShadow`, and two Lighting globals), which on a big place is a rounding
+	error next to the real costs: every `Decal` and `Texture` in the world, every
+	light and post-processing effect, and shadow/IBL work for the whole map.
 
-	A pass is followed by a LONG pause (RESCAN_SECONDS) before the next one. That
-	pause is the fix for a real defect: the first revision cleared the snapshot
-	when the walk finished, so the very next tick re-walked the whole of Workspace
-	and the anti-lag pass became the stutter it was meant to remove. Re-sweeping
-	slowly (rather than never) keeps objects that stream in later covered.
+	What it does now, in three independently switchable groups (see
+	`perf.removeEffects` / `perf.removeTextures` / `perf.cull`):
 
-	Everything disabled is remembered and put back, so switching the option off
-	restores the world.
+	  EFFECTS   ParticleEmitter, Trail, Beam, Fire, Smoke, Sparkles, Explosion ->
+	            `Enabled = false`; PointLight/SpotLight/SurfaceLight ->
+	            `Enabled = false`; Bloom/Blur/SunRays/DepthOfField/ColorCorrection
+	            -> `Enabled = false`; Atmosphere.Density -> 0; Clouds off.
+	  TEXTURES  Decal and Texture -> `Transparency = 1`. They are still there and
+	            still scriptable; they simply stop being drawn and sampled.
+	  CULLING   BasePart.CastShadow -> false, Lighting.GlobalShadows off,
+	            ShadowSoftness 0, EnvironmentDiffuse/SpecularScale -> 0.
+
+	WHAT IT DELIBERATELY DOES NOT TOUCH
+
+	  * `BasePart.Material` / `Reflectance`. Material is not only a render hint --
+	    it feeds the physics material (friction, elasticity), so "optimising" it
+	    would quietly change how the player walks. A performance switch must not
+	    be able to alter gameplay.
+	  * `BasePart.Transparency`. Turning the world invisible is not optimisation.
+	  * Anything under `PlayerGui`. `ImageLabel.ImageTransparency` is in the same
+	    shape as `Decal.Transparency`, and only the Workspace walk keeps a
+	    blanket "hide every image" rule away from the interface.
+
+	Every change is recorded as {object, property, original} and replayed on
+	disable, so switching the option off -- or unloading the script -- puts the
+	world back exactly as it was. Objects that stream out are skipped on restore
+	rather than resurrected.
 ]]
 
 -- `Workspace` is a real Roblox global; no local alias (see game/Boss for why).
@@ -11234,40 +11845,130 @@ Perf.__index = Perf
 local BUDGET_PER_TICK = 500
 local RESCAN_SECONDS = 45
 
+-- Class -> the single property that switches it off, and the value to write.
+-- `true` means "record whatever it was and set it false"; `1` means
+-- "record whatever it was and set it to 1 (fully transparent)".
+local EFFECT_OFF = {
+	ParticleEmitter = "Enabled",
+	Trail = "Enabled",
+	Beam = "Enabled",
+	Fire = "Enabled",
+	Smoke = "Enabled",
+	Sparkles = "Enabled",
+	-- NOTE: `Explosion` is deliberately absent. It has no `Enabled` member (only
+	-- `Visible`), and an explosion is a one-frame event -- there is nothing to
+	-- switch off. Listing it would cost a failed property read per explosion.
+	PointLight = "Enabled",
+	SpotLight = "Enabled",
+	SurfaceLight = "Enabled",
+	BloomEffect = "Enabled",
+	BlurEffect = "Enabled",
+	SunRaysEffect = "Enabled",
+	DepthOfFieldEffect = "Enabled",
+	ColorCorrectionEffect = "Enabled",
+	Clouds = "Enabled",
+}
+
+local TEXTURE_HIDE = {
+	Decal = "Transparency",
+	Texture = "Transparency",
+}
+
 function Perf.new(context)
 	local self = setmetatable({
 		store = context.store,
 		scheduler = context.scheduler,
 		lighting = nil,
-		particles = {},
-		shadows = {},
 		snapshot = nil,
 		cursor = 0,
 		disabled = 0,
 		nextScanAt = nil,
+		-- One list of reversible edits: {object = , prop = , value = }.
+		restores = {},
+		groups = { effects = 0, textures = 0, culled = 0 },
 	}, Perf)
 	return self
+end
+
+-- Record the original value and apply the new one. Called for one object and one
+-- property; skipping the record when nothing would change keeps `restores` (and
+-- the counter the UI reads) honest.
+local function setProp(self, object, prop, value, group)
+	local ok, current = pcall(function()
+		return object[prop]
+	end)
+	if not ok or current == value then
+		return false
+	end
+	table.insert(self.restores, { object = object, prop = prop, value = current, group = group })
+	local applied = pcall(function()
+		object[prop] = value
+	end)
+	if applied then
+		self.disabled += 1
+		self.groups[group] += 1
+		return true
+	end
+	-- The write failed: drop the record, or disable() would "restore" a value
+	-- that was never changed.
+	table.remove(self.restores)
+	return false
 end
 
 function Perf.enable(self)
 	if self.lighting ~= nil then
 		return
 	end
-	self.lighting = {
-		GlobalShadows = Lighting.GlobalShadows,
-		ShadowSoftness = Lighting.ShadowSoftness,
+
+	--[[
+		The Lighting globals are read ONCE per enable and replayed on disable.
+
+		They are not part of the descendant walk because they are not instances,
+		and because they are the cheapest big win available: `GlobalShadows` off
+		removes the shadow map pass for the entire map.
+	]]
+	local saved = {
+		GlobalShadows = nil,
+		ShadowSoftness = nil,
+		EnvironmentDiffuseScale = nil,
+		EnvironmentSpecularScale = nil,
 	}
 	pcall(function()
-		Lighting.GlobalShadows = false
-		Lighting.ShadowSoftness = 0
+		saved.GlobalShadows = Lighting.GlobalShadows
 	end)
-	self.particles = {}
-	self.shadows = {}
+	pcall(function()
+		saved.ShadowSoftness = Lighting.ShadowSoftness
+	end)
+	pcall(function()
+		saved.EnvironmentDiffuseScale = Lighting.EnvironmentDiffuseScale
+	end)
+	pcall(function()
+		saved.EnvironmentSpecularScale = Lighting.EnvironmentSpecularScale
+	end)
+	self.lighting = saved
+
+	self.restores = {}
+	self.groups = { effects = 0, textures = 0, culled = 0 }
+	self.disabled = 0
 	self.snapshot = nil
 	self.cursor = 0
-	self.disabled = 0
 	-- Due immediately: the first sweep starts on the next tick.
 	self.nextScanAt = 0
+end
+
+local function applyCulling(self)
+	pcall(function()
+		Lighting.GlobalShadows = false
+	end)
+	pcall(function()
+		Lighting.ShadowSoftness = 0
+	end)
+	pcall(function()
+		Lighting.EnvironmentDiffuseScale = 0
+	end)
+	pcall(function()
+		Lighting.EnvironmentSpecularScale = 0
+	end)
 end
 
 function Perf.tick(self, now)
@@ -11284,7 +11985,22 @@ function Perf.tick(self, now)
 			return
 		end
 		local ok, descendants = pcall(function()
-			return Workspace:GetDescendants()
+			--[[
+				WORKSPACE **AND LIGHTING**.
+
+				Post-processing (Bloom, Blur, SunRays, DepthOfField,
+				ColorCorrection, Atmosphere, Clouds) lives under `Lighting`, not
+				under `Workspace` -- so a walk that only covered Workspace could
+				never reach the group the "移除特效" switch promises. `Sky` is left
+				alone on purpose: it is the background, and turning it off is not
+				an optimisation, it is a different game.
+			]]
+			local out = Workspace:GetDescendants()
+			local effects = Lighting:GetDescendants()
+			for _, object in ipairs(effects) do
+				table.insert(out, object)
+			end
+			return out
 		end)
 		if not ok then
 			-- A failed walk must not be retried every frame either.
@@ -11293,6 +12009,20 @@ function Perf.tick(self, now)
 		end
 		self.snapshot = descendants
 		self.cursor = 0
+
+		--[[
+			The switch state is read ONCE per sweep, not once per object.
+
+			Reading four store paths 500 times a tick would cost more than the
+			walk, and a sweep that changed its mind half way through would leave
+			the world in a state no single setting describes.
+		]]
+		self.wantEffects = self.store:get("perf.removeEffects") ~= false
+		self.wantTextures = self.store:get("perf.removeTextures") ~= false
+		self.wantCull = self.store:get("perf.cull") ~= false
+		if self.wantCull then
+			applyCulling(self)
+		end
 		return
 	end
 
@@ -11301,16 +12031,20 @@ function Perf.tick(self, now)
 		local object = list[index]
 		if object.Parent ~= nil then
 			local class = object.ClassName
-			if class == "ParticleEmitter" or class == "Trail" or class == "Beam" then
-				if object.Enabled then
-					object.Enabled = false
-					table.insert(self.particles, object)
-					self.disabled += 1
+			local effectProp = if self.wantEffects then EFFECT_OFF[class] else nil
+			if effectProp ~= nil then
+				setProp(self, object, effectProp, false, "effects")
+			elseif class == "Atmosphere" then
+				if self.wantEffects then
+					setProp(self, object, "Density", 0, "effects")
 				end
-			elseif class == "BasePart" and object.CastShadow then
-				object.CastShadow = false
-				table.insert(self.shadows, object)
-				self.disabled += 1
+			else
+				local textureProp = if self.wantTextures then TEXTURE_HIDE[class] else nil
+				if textureProp ~= nil then
+					setProp(self, object, textureProp, 1, "textures")
+				elseif self.wantCull and object:IsA("BasePart") then
+					setProp(self, object, "CastShadow", false, "culled")
+				end
 			end
 		end
 	end
@@ -11329,40 +12063,105 @@ function Perf.disable(self)
 	-- The read-out means "objects disabled right now", so it goes back to zero
 	-- with them; leaving the old total made the counter climb forever.
 	self.disabled = 0
+	self.groups = { effects = 0, textures = 0, culled = 0 }
 
-	for _, object in ipairs(self.particles) do
-		if object.Parent ~= nil then
+	-- Reverse order, so anything that was touched twice ends on its first value.
+	for index = #self.restores, 1, -1 do
+		local record = self.restores[index]
+		local object = record.object
+		if object ~= nil and object.Parent ~= nil then
 			pcall(function()
-				object.Enabled = true
+				object[record.prop] = record.value
 			end)
 		end
 	end
-	table.clear(self.particles)
-
-	for _, object in ipairs(self.shadows) do
-		if object.Parent ~= nil then
-			pcall(function()
-				object.CastShadow = true
-			end)
-		end
-	end
-	table.clear(self.shadows)
+	table.clear(self.restores)
 
 	local saved = self.lighting
 	if saved ~= nil then
 		self.lighting = nil
+		Perf.restoreLighting(saved)
+	end
+end
+
+-- Put the four global Lighting values back. Split out so the `perf.cull`
+-- subscription can undo just this group without tearing the whole pass down.
+function Perf.restoreLighting(saved)
+	if saved == nil then
+		return
+	end
+	if saved.GlobalShadows ~= nil then
 		pcall(function()
 			Lighting.GlobalShadows = saved.GlobalShadows
+		end)
+	end
+	if saved.ShadowSoftness ~= nil then
+		pcall(function()
 			Lighting.ShadowSoftness = saved.ShadowSoftness
 		end)
 	end
+	if saved.EnvironmentDiffuseScale ~= nil then
+		pcall(function()
+			Lighting.EnvironmentDiffuseScale = saved.EnvironmentDiffuseScale
+		end)
+	end
+	if saved.EnvironmentSpecularScale ~= nil then
+		pcall(function()
+			Lighting.EnvironmentSpecularScale = saved.EnvironmentSpecularScale
+		end)
+	end
 end
+
+--[[
+	Undo ONE group and forget its records.
+
+	Used when the user switches one of the three sub-options back off: the sweep
+	can only ever switch things OFF, so waiting up to 45 s for it to "notice" was
+	the difference between a control that works and one that looks broken. The
+	remaining groups keep their records, so the pass stays half-applied exactly as
+	the switch state says.
+]]
+function Perf.restoreGroup(self, group)
+	local kept = {}
+	for _, record in ipairs(self.restores) do
+		if record.group == group then
+			local object = record.object
+			if object ~= nil and object.Parent ~= nil then
+				pcall(function()
+					object[record.prop] = record.value
+				end)
+			end
+			self.disabled = math.max(0, self.disabled - 1)
+			self.groups[group] = math.max(0, self.groups[group] - 1)
+		else
+			table.insert(kept, record)
+		end
+	end
+	self.restores = kept
+	if group == "culled" then
+		Perf.restoreLighting(self.lighting)
+	end
+	-- A fresh sweep with the new switch state; the old snapshot's decisions are
+	-- no longer the current ones.
+	self.snapshot = nil
+	self.cursor = 0
+	self.nextScanAt = 0
+end
+
+local GROUP_OF_PATH = {
+	["perf.removeEffects"] = "effects",
+	["perf.removeTextures"] = "textures",
+	["perf.cull"] = "culled",
+}
 
 function Perf.stats(self)
 	return {
 		active = self.lighting ~= nil,
 		disabled = self.disabled,
 		scanning = self.snapshot ~= nil,
+		effects = self.groups.effects,
+		textures = self.groups.textures,
+		culled = self.groups.culled,
 	}
 end
 
@@ -11399,6 +12198,21 @@ function Perf.install(context)
 			Perf.disable(self)
 		end,
 	})
+
+	--[[
+		Turning one of the three sub-switches OFF has to undo that group, and the
+		sweep only runs every 45 s -- waiting that long for "I switched textures
+		back on" to take effect reads as a broken control. The subscription
+		undoes the affected group immediately.
+	]]
+	for _, path in ipairs({ "perf.removeEffects", "perf.removeTextures", "perf.cull" }) do
+		store:subscribe(path, function(_, value)
+			if value == true or self.lighting == nil then
+				return
+			end
+			Perf.restoreGroup(self, GROUP_OF_PATH[path] or "culled")
+		end)
+	end
 
 	return self
 end
@@ -11488,6 +12302,97 @@ function Train.install(context)
 	local throttled = nil
 	local failures = 0
 	local disabledUntil = 0
+	-- The event-adaptive controller's estimate. Created eagerly; it is only
+	-- consulted while `train.eventAdaptive` is on.
+	local adaptive = TrainRate.newAdaptive()
+	-- Payloads the transport refused since the last adaptive update. A refusal is
+	-- a faster "slow down" signal than latency, so it is folded into the same
+	-- controller rather than ignored.
+	local refusedSinceUpdate = 0
+
+	--[[
+		ONE QUESTION, ASKED BY TWO TASKS: "does training need the hand right now?"
+
+		Training and punching cannot both hold the tool, so when training is
+		enabled DURING combat the hand has to be arbitrated. `arbitrationActive`
+		is that condition, shared by the two tasks that care:
+
+		  * the tool arbiter (`dualTool`) alternates the hand on a symmetric dwell;
+		  * the plain tool task (`tool`) must stand DOWN while it does, or the two
+		    equip different tools in the same frame and nothing is ever held long
+		    enough to register a rep.
+
+		It is deliberately true for "global kill" and for a boss fight, because
+		both re-equip the glove on every punch -- the asymmetry the user reported
+		("切换拳套的速度远远超过切换锻炼工具的速度").
+	]]
+	local function combatActive()
+		if isCombatBusy() then
+			return true
+		end
+		return store:get("boss.auto") == true and isBossAlive()
+	end
+
+	local function arbitrationActive()
+		if not (store:get("train.auto") == true or store:get("train.fast") == true) then
+			return false
+		end
+		if not combatActive() then
+			return false
+		end
+		if store:get("kill.dualEnabled") == true then
+			return true
+		end
+		if store:get("train.duringKill") == true and isCombatBusy() then
+			return true
+		end
+		if store:get("train.duringBoss") == true and store:get("boss.auto") == true and isBossAlive() then
+			return true
+		end
+		return false
+	end
+
+	--[[
+		The tool "sets" the arbiter alternates between, taken straight from the
+		four switches the training page exposes. Shared with the `tool` task so the
+		order can never drift between the two paths.
+	]]
+	local function toolGroups()
+		local groups = {}
+		if store:get("train.toolPush") == true then
+			table.insert(groups, Tools.PUSHUP)
+		end
+		if store:get("train.toolHand") == true then
+			table.insert(groups, Tools.HANDSTAND)
+		end
+		if store:get("train.toolSit") == true then
+			table.insert(groups, Tools.SITUP)
+		end
+		if store:get("train.toolDumbbell") == true then
+			table.insert(groups, Tools.DUMBBELL)
+		end
+		return groups
+	end
+
+	-- The measured latency, or 0 when there is no sample. Roblox answers 0 for a
+	-- ping it has not measured, and TrainRate treats 0 as "no sample".
+	local function currentPing()
+		local metrics = context.metrics
+		if metrics == nil then
+			return 0
+		end
+		local ok, reading = pcall(function()
+			return metrics:reading()
+		end)
+		if not ok or type(reading) ~= "table" then
+			return 0
+		end
+		local ping = tonumber(reading.ping)
+		if ping == nil or ping < 0 then
+			return 0
+		end
+		return ping
+	end
 
 	-- The channel has to be (re)created when the throttle switch flips, because
 	-- "unlimited" and "rate-limited" are different objects, not a setting.
@@ -11528,11 +12433,22 @@ function Train.install(context)
 				failures = 0
 			end
 
+			local eventAdaptive = store:get("train.eventAdaptive") == true
+
 			local settings = {
 				auto = store:get("train.auto") == true,
 				fast = store:get("train.fast") == true,
 				rate = tonumber(store:get("train.rate")) or 20,
-				adaptive = store:get("train.adaptive") == true,
+				--[[
+					FRAME-RATE ADAPTIVE IS MASKED BY EVENT ADAPTIVE.
+
+					The user asked for exactly this: "开启此功能后，帧率自适应功能会被
+					屏蔽掉，即使打开了触发器它仍然是不执行的". Two controllers writing
+					one rate is how the manual box, the FPS scaler and the latency
+					probe ended up fighting ("还会抢线"); the newest and most
+					specific one owns the number and the other is ignored.
+				]]
+				adaptive = store:get("train.adaptive") == true and eventAdaptive ~= true,
 				adaptiveThresh = tonumber(store:get("train.adaptiveThresh")) or 30,
 				-- Was written by the UI and read by nobody (in V1007 either).
 				adaptiveMax = tonumber(store:get("train.adaptiveMax")) or 5000,
@@ -11552,7 +12468,37 @@ function Train.install(context)
 				end
 			end
 
-			local rate = TrainRate.compute(settings, fps)
+			local rate = 0
+			local source = ""
+			if eventAdaptive then
+				--[[
+					PROBE FOR THE FASTEST RATE THE CONNECTION WILL TAKE.
+
+					The controller climbs while the latency stays under the target
+					and halves on the first breach, so "as fast as possible" is
+					discovered rather than typed -- and it can never ramp past the
+					user's own ceiling.
+				]]
+				local ceiling = tonumber(store:get("train.adaptiveMax")) or TrainRate.MAX_RATE
+				rate = TrainRate.adaptiveUpdate(adaptive, currentPing(), now, {
+					minRate = TrainRate.ADAPTIVE_MIN,
+					maxRate = math.min(TrainRate.MAX_RATE, math.max(TrainRate.ADAPTIVE_MIN, ceiling)),
+					pingTarget = tonumber(store:get("train.eventPingTarget")) or 150,
+					refused = refusedSinceUpdate,
+				})
+				refusedSinceUpdate = 0
+				source = string.format("自适应(%s)", adaptive.reason)
+			else
+				rate = TrainRate.compute(settings, fps)
+				source = if settings.fast then "手动" elseif settings.auto then "自动" else "关闭"
+				if settings.adaptive then
+					source = "帧率自适应"
+				end
+			end
+			-- Published for the page: "why is it sending at 40/s when I typed 900"
+			-- is otherwise unanswerable without reading this file.
+			store:set("train.effRate", math.floor(rate + 0.5))
+			store:set("train.rateSource", source)
 			local perFrame = math.max(1, math.floor(tonumber(store:get("cfg.netBurst")) or 40))
 			local budget = TrainRate.step(state, rate, dt, perFrame)
 			if budget <= 0 then
@@ -11570,6 +12516,7 @@ function Train.install(context)
 			delivered += sent
 			if sent < budget then
 				refused += (budget - sent)
+				refusedSinceUpdate += (budget - sent)
 				TrainRate.refund(state, budget - sent)
 
 				--[[
@@ -11737,27 +12684,21 @@ function Train.install(context)
 			if cooldown then
 				return false
 			end
-			if store:get("boss.auto") == true and isBossAlive() then
-				if store:get("train.duringBoss") ~= true then
-					return false
-				end
-			end
-			-- The machine holding the player IS the exercise, so there is nothing
-			-- for the tool task to do. This is not the boss/combat conflict: it is
-			-- the case where training is already happening at a HIGHER depth.
-			if isMachineBusy() then
+			--[[
+				THE ARBITER OWNS THE HAND WHENEVER COMBAT AND TRAINING OVERLAP.
+
+				Two tasks equipping two different tools in the same frame is what
+				made "同时锻炼" useless: whichever ran last won, and the glove is
+				re-equipped on every punch (up to 120x/s) while this task only gets
+				a look every 0.12s. Exactly ONE of them may own the hand, and when
+				both want it the alternation below is the owner -- that is what
+				makes the two swap rates equal ("两两齐平").
+			]]
+			if arbitrationActive() then
 				return false
 			end
-			if isCombatBusy() then
-				if store:get("train.duringKill") ~= true then
-					return false
-				end
-				-- Dual-tool combat keeps the glove; the `dual` task swaps the
-				-- training tool in on its own schedule. Handing the tool task the
-				-- glove as well would make the two fight over it every frame.
-				if store:get("kill.dualEnabled") == true then
-					return false
-				end
+			if isMachineBusy() then
+				return false
 			end
 			return true
 		end,
@@ -11767,19 +12708,7 @@ function Train.install(context)
 			end
 			lastAttempt = now
 
-			local groups = {}
-			if store:get("train.toolPush") == true then
-				table.insert(groups, Tools.PUSHUP)
-			end
-			if store:get("train.toolHand") == true then
-				table.insert(groups, Tools.HANDSTAND)
-			end
-			if store:get("train.toolSit") == true then
-				table.insert(groups, Tools.SITUP)
-			end
-			if store:get("train.toolDumbbell") == true then
-				table.insert(groups, Tools.DUMBBELL)
-			end
+			local groups = toolGroups()
 			if #groups == 0 then
 				missingSince = 0
 				return
@@ -11825,62 +12754,87 @@ function Train.install(context)
 	})
 
 	--[[
-		Alternate the glove and a training tool while fighting.
+		THE TOOL ARBITER: alternate the glove and a training tool while fighting.
 
-		V1007 flipped a mode string every 0.05s. Same idea, but the two halves are
-		explicit and it stands down whenever the glove is not the right thing to
-		hold.
+		V1007 flipped a mode string every 0.05 s and had no idea what the punch
+		path was doing. That is the bug this replaces, and it was an ASYMMETRY
+		rather than a missing feature: `Combat.punch` re-equips the glove on every
+		punch (twice per attack tick, plus the 0.05 s boss cadence -- up to 120x a
+		second), while the training tool was only offered once per 0.05 s flip. The
+		glove therefore won essentially every frame and a rep never registered, so
+		"同时锻炼" did nothing even when it was switched on.
+
+		Three changes make the two halves equal ("两两齐平"):
+
+		  * ONE DWELL FOR BOTH HALVES, `kill.dualInterval` (default 0.6 s), and it
+		    is a setting so the user can tune it;
+		  * the held tool is published to the store as `train.dualTool`, and BOTH
+		    punch paths (Combat.punch and the punch guard) stand down while it
+		    reads "train" -- so the training half is a real window, not a race;
+		  * the hand is re-asserted every 0.08 s rather than once per flip, so the
+		    game taking the tool away is repaired inside the same window.
+
+		The mode only becomes "train" after the tool is actually in hand: parking
+		the hand on a tool the player does not own would mean no punches AND no
+		reps for the whole dwell.
 	]]
 	local dualMode = "punch"
-	local lastDual = 0
+	local dualSince = 0
+	local dualAssertAt = 0
+
+	local function setDualMode(mode, now)
+		dualMode = mode
+		dualSince = now
+		store:set("train.dualTool", mode)
+	end
 
 	scheduler:register({
 		id = "dual",
 		priority = 62,
-		enabled = function()
-			if store:get("kill.dualEnabled") ~= true then
-				return false
-			end
-			if not (store:get("train.auto") == true or store:get("train.fast") == true) then
-				return false
-			end
-			if not isCombatBusy() then
-				return false
-			end
-			return true
+		enabled = arbitrationActive,
+		onEnable = function()
+			dualAssertAt = 0
+			setDualMode("punch", os.clock())
+		end,
+		onDisable = function()
+			-- Leaving the arbitration must hand the glove back immediately, or
+			-- the guard would refuse to re-equip while nothing is training.
+			setDualMode("punch", os.clock())
 		end,
 		tick = function(_dt, now)
-			if now - lastDual < 0.05 then
+			if now - dualAssertAt < 0.08 then
 				return
 			end
-			lastDual = now
+			dualAssertAt = now
 
 			local humanoid = character:humanoid()
 			local current = character:current()
 			if humanoid == nil or current == nil then
 				return
 			end
+			local player = Players.LocalPlayer
+			local dwell = math.max(0.1, tonumber(store:get("kill.dualInterval")) or 0.6)
 
-			if dualMode == "punch" then
-				local groups = {}
-				if store:get("train.toolPush") == true then
-					table.insert(groups, Tools.PUSHUP)
+			if dualMode == "train" then
+				local groups = toolGroups()
+				if #groups > 0 and Tools.equipFirst(current, humanoid, player, groups) then
+					if now - dualSince >= dwell then
+						setDualMode("punch", now)
+					end
+					return
 				end
-				if store:get("train.toolHand") == true then
-					table.insert(groups, Tools.HANDSTAND)
+				-- No usable training tool: never park the hand on a tool that is
+				-- not there. Back to punching at once.
+				setDualMode("punch", now)
+				return
+			end
+
+			Tools.equip(current, humanoid, player, Tools.PUNCH)
+			if now - dualSince >= dwell then
+				local groups = toolGroups()
+				if #groups > 0 and Tools.equipFirst(current, humanoid, player, groups) then
+					setDualMode("train", now)
 				end
-				if store:get("train.toolSit") == true then
-					table.insert(groups, Tools.SITUP)
-				end
-				if store:get("train.toolDumbbell") == true then
-					table.insert(groups, Tools.DUMBBELL)
-				end
-				if #groups > 0 and Tools.equipFirst(current, humanoid, Players.LocalPlayer, groups) then
-					dualMode = "train"
-				end
-			else
-				Tools.equip(current, humanoid, Players.LocalPlayer, Tools.PUNCH)
-				dualMode = "punch"
 			end
 		end,
 	})
@@ -11888,8 +12842,14 @@ function Train.install(context)
 	return {
 		task = definition,
 		state = state,
+		adaptive = adaptive,
 		stats = function()
-			return { delivered = delivered, refused = refused }
+			return {
+				delivered = delivered,
+				refused = refused,
+				effRate = adaptive.rate,
+				dualTool = dualMode,
+			}
 		end,
 	}
 end
@@ -12020,11 +12980,28 @@ function Theme.toColor3(triple: RGB): Color3
 	return Color3.fromRGB(triple.r, triple.g, triple.b)
 end
 
-function Theme.toRGB(color: Color3): RGB
+--[[
+	Colour -> integer RGB, tolerant of anything that is not one.
+
+	`Theme.apply` walks every widget in the interface. One object whose colour is
+	not readable used to throw straight out of the walk, aborting the repaint
+	HALFWAY -- and a half-repainted interface is exactly the "选择了主题但颜色残留在
+	旧主题" the user reported. Returning nil lets the caller skip that one property.
+]]
+function Theme.toRGB(color: Color3): RGB?
+	if typeof(color) ~= "Color3" then
+		return nil
+	end
+	local ok, red, green, blue = pcall(function()
+		return color.R, color.G, color.B
+	end)
+	if not ok or type(red) ~= "number" or type(green) ~= "number" or type(blue) ~= "number" then
+		return nil
+	end
 	return {
-		r = math.floor(color.R * 255 + 0.5),
-		g = math.floor(color.G * 255 + 0.5),
-		b = math.floor(color.B * 255 + 0.5),
+		r = math.floor(red * 255 + 0.5),
+		g = math.floor(green * 255 + 0.5),
+		b = math.floor(blue * 255 + 0.5),
 	}
 end
 
@@ -12074,62 +13051,79 @@ function Theme.apply(root: Instance?, remap: Remap, duration: number?): number
 	local tweenInfo = TweenInfo.new(time, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
 	local changed = 0
 
+	--[[
+		Every object is repainted inside its own pcall.
+
+		This walk touches every widget on the screen, and anything that throws
+		out of it aborts the repaint where it stands -- leaving the interface
+		HALF-themed, which is precisely the "主题切换后颜色残留在旧主题" symptom.
+		One unreadable widget should cost that widget's colour, not the whole
+		repaint.
+
+		`Theme.toRGB` returns nil for a colour it cannot read, so each branch
+		below checks before matching.
+	]]
 	for _, object in ipairs(root:GetDescendants()) do
-		for _, property in ipairs(COLOR_PROPERTIES) do
-			local ok, current = pcall(function()
-				return object[property]
-			end)
-			if ok and typeof(current) == "Color3" then
-				local mapped = Palette.nearest(remap, Theme.toRGB(current), Theme.RECOLOR_TOLERANCE)
-				if mapped ~= nil then
-					pcall(function()
+		pcall(function()
+			for _, property in ipairs(COLOR_PROPERTIES) do
+				local ok, current = pcall(function()
+					return object[property]
+				end)
+				local rgb = if ok then Theme.toRGB(current) else nil
+				if rgb ~= nil then
+					local mapped = Palette.nearest(remap, rgb, Theme.RECOLOR_TOLERANCE)
+					if mapped ~= nil then
 						TweenService:Create(object, tweenInfo, { [property] = Theme.toColor3(mapped) }):Play()
-					end)
+						changed += 1
+					end
+				end
+			end
+
+			local stroke = object:FindFirstChildOfClass("UIStroke")
+			if stroke ~= nil then
+				local rgb = Theme.toRGB(stroke.Color)
+				local mapped = if rgb ~= nil then Palette.nearest(remap, rgb, Theme.RECOLOR_TOLERANCE) else nil
+				if mapped ~= nil then
+					TweenService:Create(stroke, tweenInfo, { Color = Theme.toColor3(mapped) }):Play()
 					changed += 1
 				end
 			end
-		end
 
-		local stroke = object:FindFirstChildOfClass("UIStroke")
-		if stroke ~= nil then
-			local mapped = Palette.nearest(remap, Theme.toRGB(stroke.Color), Theme.RECOLOR_TOLERANCE)
-			if mapped ~= nil then
-				TweenService:Create(stroke, tweenInfo, { Color = Theme.toColor3(mapped) }):Play()
-				changed += 1
-			end
-		end
-
-		local gradient = object:FindFirstChildOfClass("UIGradient")
-		if gradient ~= nil then
-			local keypoints = {}
-			local touched = false
-			for _, keypoint in ipairs(gradient.Color.Keypoints) do
-				local mapped = Palette.nearest(remap, Theme.toRGB(keypoint.Value), Theme.RECOLOR_TOLERANCE)
-				if mapped ~= nil then
-					touched = true
-					table.insert(keypoints, ColorSequenceKeypoint.new(keypoint.Time, Theme.toColor3(mapped)))
-				else
-					table.insert(keypoints, ColorSequenceKeypoint.new(keypoint.Time, keypoint.Value))
+			local gradient = object:FindFirstChildOfClass("UIGradient")
+			if gradient ~= nil then
+				local sequence = gradient.Color
+				if sequence ~= nil and sequence.Keypoints ~= nil then
+					local keypoints = {}
+					local touched = false
+					for _, keypoint in ipairs(sequence.Keypoints) do
+						local rgb = Theme.toRGB(keypoint.Value)
+						local mapped = if rgb ~= nil then Palette.nearest(remap, rgb, Theme.RECOLOR_TOLERANCE) else nil
+						if mapped ~= nil then
+							touched = true
+							table.insert(keypoints, ColorSequenceKeypoint.new(keypoint.Time, Theme.toColor3(mapped)))
+						else
+							table.insert(keypoints, ColorSequenceKeypoint.new(keypoint.Time, keypoint.Value))
+						end
+					end
+					if touched then
+						TweenService:Create(gradient, tweenInfo, { Color = ColorSequence.new(keypoints) }):Play()
+						changed += 1
+					end
 				end
 			end
-			if touched then
-				pcall(function()
-					TweenService:Create(gradient, tweenInfo, { Color = ColorSequence.new(keypoints) }):Play()
-				end)
-				changed += 1
-			end
-		end
 
-		-- Buttons remember their resting colour in an attribute so that a hover
-		-- leaving cannot write the previous theme's colour back.
-		local base = object:GetAttribute(Attributes.BASE_COLOR)
-		if typeof(base) == "Color3" then
-			local mapped = Palette.nearest(remap, Theme.toRGB(base), Theme.RECOLOR_TOLERANCE)
-			if mapped ~= nil then
-				object:SetAttribute(Attributes.BASE_COLOR, Theme.toColor3(mapped))
-				changed += 1
+			-- Buttons remember their resting colour in an attribute so that a hover
+			-- leaving cannot write the previous theme's colour back.
+			local base = object:GetAttribute(Attributes.BASE_COLOR)
+			local baseRGB = Theme.toRGB(base)
+			if baseRGB ~= nil then
+				local mapped = Palette.nearest(remap, baseRGB, Theme.RECOLOR_TOLERANCE)
+				if mapped ~= nil then
+					object:SetAttribute(Attributes.BASE_COLOR, Theme.toColor3(mapped))
+					changed += 1
+				end
 			end
-		end
+		end)
 	end
 
 	return changed
@@ -12161,6 +13155,16 @@ __modules["ui/Kit"] = function()
 ]]
 
 local TweenService = game:GetService("TweenService")
+--[[
+	The GLOBAL input stream, and the reason the slider below can be dragged at
+	all. Pressing on the 18px track captures the mouse, but the pointer leaves
+	that rectangle immediately, so a handler on the GuiObject's own
+	`InputChanged` stops receiving movement the moment the drag starts. Legacy
+	V1007 used `UserInputService.InputChanged` for exactly this; the refactor
+	kept the press/release handlers and dropped the move handler, which is why
+	the slider could only be clicked.
+]]
+local UserInputService = game:GetService("UserInputService")
 
 local Attributes = require("core/Attributes")
 
@@ -12336,6 +13340,20 @@ function Kit.track(self, connection)
 end
 
 --[[
+	Report something the user just did.
+
+	The Kit does not own the toast stack (that lives in ui/Toast and needs the
+	screen), so `main.luau` installs `kit.onToast` once the stack exists. Before
+	that -- and in a headless test -- this is a silent no-op rather than an error.
+]]
+function Kit.toast(self, text, kind, duration)
+	if self.onToast == nil then
+		return
+	end
+	pcall(self.onToast, text, kind, duration)
+end
+
+--[[
 	Schedule a delayed UI callback.
 
 	Through the runtime's Timers when one was injected, so that
@@ -12483,7 +13501,7 @@ function Kit.row(self, parent, withHint)
 end
 
 function Kit.rowLabel(self, row, text, hint, reserve)
-	self:instance("TextLabel", {
+	local label = self:instance("TextLabel", {
 		BackgroundTransparency = 1,
 		Position = UDim2.fromOffset(0, if hint ~= nil then 8 else 0),
 		Size = UDim2.new(1, -(reserve or 60), 0, 20),
@@ -12494,8 +13512,9 @@ function Kit.rowLabel(self, row, text, hint, reserve)
 		TextXAlignment = Enum.TextXAlignment.Left,
 		TextYAlignment = Enum.TextYAlignment.Center,
 	}, row)
+	local hintLabel = nil
 	if hint ~= nil then
-		self:instance("TextLabel", {
+		hintLabel = self:instance("TextLabel", {
 			BackgroundTransparency = 1,
 			Position = UDim2.fromOffset(0, 28),
 			Size = UDim2.new(1, -(reserve or 60), 0, 16),
@@ -12508,6 +13527,53 @@ function Kit.rowLabel(self, row, text, hint, reserve)
 			TextXAlignment = Enum.TextXAlignment.Left,
 			TextYAlignment = Enum.TextYAlignment.Top,
 		}, row)
+	end
+	return label, hintLabel
+end
+
+--[[
+	WHY A CONTROL CAN BE LOCKED, AND BY WHAT.
+
+	A control declares `locked = function() -> (boolean, string?)` plus the store
+	path(s) it depends on (`watch`, optional `watch2`). The Kit re-evaluates on
+	every change of those paths.
+
+	This exists for one reported bug and one requested rule:
+
+	  * "当我打开帧率自适应时，频率还可以自己调整，还会抢线" -- the manual rate
+	    box has to stop accepting input while a controller owns the number;
+	  * "开启根据事件自适应后，帧率自适应会被屏蔽掉" -- the FPS toggle has to be
+	    un-clickable, not merely ignored, or the user keeps flipping a switch
+	    that no longer does anything.
+
+	Watching the store (rather than calling a setter from the other control) is
+	what keeps the two widgets from having to know about each other, and it means
+	a loaded config or a config slot gets the same treatment as a click.
+]]
+function Kit.lockState(self, spec)
+	if spec.locked == nil then
+		return false, nil
+	end
+	local ok, locked, reason = pcall(spec.locked)
+	if not ok then
+		return false, nil
+	end
+	return locked == true, reason
+end
+
+function Kit.watchLock(self, spec, apply)
+	if spec.locked == nil then
+		return
+	end
+	local function refresh()
+		local locked, reason = Kit.lockState(self, spec)
+		apply(locked, reason)
+	end
+	refresh()
+	for _, path in ipairs({ spec.watch, spec.watch2 }) do
+		if path ~= nil then
+			self:track(self.store:subscribe(path, refresh))
+		end
 	end
 end
 
@@ -12533,9 +13599,14 @@ function Kit.animate(self, button, base)
 		end
 	end))
 	self:track(button.MouseLeave:Connect(function()
-		if self.theming then
-			return
-		end
+		--[[
+			Deliberately NOT gated on `theming`.
+
+			Restoring the resting colour is always correct, and the resting colour
+			kept in `_MK_Base` is remapped by the theme pass -- so suppressing this
+			during a theme switch only meant a button the pointer had been over
+			stayed stuck on the hover colour (one of the ways "颜色残留" showed up).
+		]]
 		local stored = button:GetAttribute(Attributes.BASE_COLOR) or resting
 		self:tween(button, 0.12, { BackgroundColor3 = stored })
 		self:tween(scale, 0.12, { Scale = 1 })
@@ -12563,7 +13634,7 @@ end
 ]]
 function Kit.toggle(self, parent, spec)
 	local row = self:row(parent, spec.hint ~= nil)
-	self:rowLabel(row, spec.label, spec.hint)
+	local _, hintLabel = self:rowLabel(row, spec.label, spec.hint)
 
 	local track = self:instance("Frame", {
 		AnchorPoint = Vector2.new(1, 0.5),
@@ -12652,7 +13723,35 @@ function Kit.toggle(self, parent, spec)
 				task.spawn(spec.onChange, next)
 			end
 		end
+		--[[
+			Report the flip.
+
+			V1007 toasted every toggle ("[名称] 已开启", 1.2 s) and the refactor
+			dropped it, which is one of the "通知气泡消失了" the user reported:
+			most switches give no feedback at all beyond the knob moving, and on a
+			page of twenty switches that is indistinguishable from a dead click.
+			Toast coalescing keeps a rapid sequence from stacking.
+		]]
+		if spec.silent ~= true then
+			self:toast(tostring(spec.label) .. (if next then "：已开启" else "：已关闭"), if next then "success" else "info", 1.2)
+		end
 	end))
+
+	--[[
+		Locked: the control is un-clickable and shows why.
+
+		`hit.Visible = false` is the part that actually disables it -- a TextButton
+		always receives clicks, so dimming alone would still flip the switch.
+	]]
+	Kit.watchLock(self, spec, function(locked, reason)
+		hit.Visible = not locked
+		track.BackgroundTransparency = if locked then 0.55 else 0
+		knob.BackgroundTransparency = if locked then 0.55 else 0
+		if hintLabel ~= nil then
+			hintLabel.Text = if locked and reason ~= nil then reason else (spec.hint or "")
+			hintLabel.TextColor3 = if locked then self:color("Yellow") else self:color("TextMuted")
+		end
+	end)
 
 	return {
 		get = function()
@@ -12672,7 +13771,7 @@ end
 -- spec = { label, path?, min, max, default?, hint? } -- a whole number box.
 function Kit.input(self, parent, spec)
 	local row = self:row(parent, spec.hint ~= nil)
-	self:rowLabel(row, spec.label, spec.hint, 110)
+	local _, hintLabel = self:rowLabel(row, spec.label, spec.hint, 110)
 
 	local minimum = spec.min or 0
 	local maximum = spec.max or 100
@@ -12701,7 +13800,13 @@ function Kit.input(self, parent, spec)
 		end)
 	end
 
+	local locked = false
 	self:track(box.FocusLost:Connect(function()
+		-- A locked box must not write anything: the value is owned by whichever
+		-- controller locked it, and a stale edit would silently override it.
+		if locked then
+			return
+		end
 		local parsed = tonumber(box.Text)
 		if parsed == nil then
 			box.Text = tostring(fallback)
@@ -12715,7 +13820,25 @@ function Kit.input(self, parent, spec)
 		if spec.onChange ~= nil then
 			task.spawn(spec.onChange, clamped)
 		end
+		if spec.silent ~= true then
+			self:toast(string.format("[%s] = %d", tostring(spec.label), clamped), "info", 1.4)
+		end
 	end))
+
+	Kit.watchLock(self, spec, function(isLocked, reason)
+		locked = isLocked
+		box.TextEditable = not isLocked
+		box.Active = not isLocked
+		box.TextColor3 = if isLocked then self:color("TextMuted") else self:color("TextPrimary")
+		local stroke = box:FindFirstChildOfClass("UIStroke")
+		if stroke ~= nil then
+			stroke.Transparency = if isLocked then 0.6 else 0
+		end
+		if hintLabel ~= nil then
+			hintLabel.Text = if isLocked and reason ~= nil then reason else (spec.hint or "")
+			hintLabel.TextColor3 = if isLocked then self:color("Yellow") else self:color("TextMuted")
+		end
+	end)
 
 	return box
 end
@@ -12783,7 +13906,7 @@ function Kit.slider(self, parent, spec)
 	end
 
 	local row = self:row(parent, spec.hint ~= nil)
-	self:rowLabel(row, spec.label, spec.hint, 70)
+	local _, hintLabel = self:rowLabel(row, spec.label, spec.hint, 70)
 
 	local valueLabel = self:instance("TextLabel", {
 		BackgroundTransparency = 1,
@@ -12875,8 +13998,10 @@ function Kit.slider(self, parent, spec)
 		and then to 40.
 	]]
 	local rect = nil
+	local dragging = false
+	local locked = false
 	local function applyFromX(x)
-		if rect == nil or rect.width <= 0 then
+		if locked or rect == nil or rect.width <= 0 then
 			return
 		end
 		local f = math.clamp((x - rect.x) / rect.width, 0, 1)
@@ -12892,15 +14017,46 @@ function Kit.slider(self, parent, spec)
 		end
 	end
 
+	local function sliderToast()
+		if spec.silent == true or spec.label == nil then
+			return
+		end
+		self:toast(string.format("[%s] = %d", tostring(spec.label), current), "info", 1.2)
+	end
+
 	self:track(hit.InputBegan:Connect(function(input)
 		if input.UserInputType ~= Enum.UserInputType.MouseButton1
 			and input.UserInputType ~= Enum.UserInputType.Touch then
 			return
 		end
+		if locked then
+			return
+		end
+		dragging = true
 		local position = trackBar.AbsolutePosition
 		local size = trackBar.AbsoluteSize
 		rect = { x = position.X, width = size.X }
 		self:tween(knob, 0.1, { Size = UDim2.fromOffset(26, 26) })
+		applyFromX(input.Position.X)
+	end))
+
+	--[[
+		THE MOVE HANDLER IS ON THE GLOBAL INPUT SERVICE.
+
+		This is the line that makes dragging work. The hit target is an 18-pixel
+		tall strip, so the pointer leaves it on the first movement -- a handler on
+		the GuiObject's own InputChanged gets one event and then nothing, which is
+		why the control could only be clicked and never dragged. Legacy V1007 used
+		`UserInputService.InputChanged` (`IC` in its locals) for the same reason.
+	]]
+	self:track(UserInputService.InputChanged:Connect(function(input)
+		if not dragging then
+			return
+		end
+		if input.UserInputType ~= Enum.UserInputType.MouseMovement
+			and input.UserInputType ~= Enum.UserInputType.Touch then
+			return
+		end
 		applyFromX(input.Position.X)
 	end))
 
@@ -12909,15 +14065,29 @@ function Kit.slider(self, parent, spec)
 			and input.UserInputType ~= Enum.UserInputType.Touch then
 			return
 		end
-		if rect == nil then
+		if not dragging then
 			return
 		end
+		dragging = false
 		rect = nil
 		self:tween(knob, 0.16, { Size = UDim2.fromOffset(20, 20) }, Enum.EasingStyle.Quint)
 		if spec.commitOnly and spec.onChange ~= nil then
 			task.spawn(spec.onChange, current)
 		end
+		-- ONE toast per gesture, on release -- V1007 did the same, and it is the
+		-- shape that makes the notification useful instead of a per-pixel flood.
+		sliderToast()
 	end))
+
+	Kit.watchLock(self, spec, function(isLocked, reason)
+		locked = isLocked
+		hit.Visible = not isLocked
+		trackBar.BackgroundTransparency = if isLocked then 0.6 else 0
+		if hintLabel ~= nil then
+			hintLabel.Text = if isLocked and reason ~= nil then reason else (spec.hint or "")
+			hintLabel.TextColor3 = if isLocked then self:color("Yellow") else self:color("TextMuted")
+		end
+	end)
 
 	return {
 		get = function()
@@ -13054,14 +14224,46 @@ function Kit.dropdown(self, parent, spec)
 		self:tween(button, 0.16, { BackgroundColor3 = self:color("White") })
 	end
 
-	local function draw()
-		for _, child in ipairs(listFrame:GetChildren()) do
-			if child:IsA("TextButton") then
-				child:Destroy()
+	--[[
+		THE OPTION LIST IS POOLED, AND ONLY BUILT WHEN IT IS OPENED.
+
+		This was the single biggest cost in the interface. Two pages rebuild a
+		dropdown on a timer -- the training page's machine list every 2 s (whose
+		index list is as long as the number of machines in the world, 160+ entries
+		in the live dump) and the kill page's player list on every UI tick -- and
+		`draw()` destroyed and recreated every option button each time. That is
+		hundreds of Instance.new + Destroy + UIListLayout passes per second, for a
+		list the user is not even looking at.
+
+		Three changes:
+
+		  * a `refresh` whose values are unchanged does NOT redraw at all
+		    (element-wise compare; the lists are short and this is not on a hot
+		    path in the sense that matters -- allocating is what was expensive);
+		  * `draw()` reuses the buttons it already made instead of destroying
+		    them, and only hides the surplus;
+		  * the list is built lazily, on open, so a dropdown nobody opens costs
+		    nothing beyond its trigger button.
+	]]
+	local entries = {}
+	local entryOption = {}
+	local drawn = false
+	local function sameValues(a, b)
+		if #a ~= #b then
+			return false
+		end
+		for index = 1, #a do
+			if a[index] ~= b[index] then
+				return false
 			end
 		end
-		for index, option in ipairs(values) do
-			local entry = self:instance("TextButton", {
+		return true
+	end
+
+	local function ensureEntry(index, option)
+		local entry = entries[index]
+		if entry == nil then
+			entry = self:instance("TextButton", {
 				Size = UDim2.new(1, 0, 0, DROPDOWN_OPTION_HEIGHT),
 				BackgroundColor3 = self:color("BgSoft"),
 				BorderSizePixel = 0,
@@ -13083,22 +14285,50 @@ function Kit.dropdown(self, parent, spec)
 			self:track(entry.MouseLeave:Connect(function()
 				self:tween(entry, 0.1, { BackgroundColor3 = self:color("BgSoft") })
 			end))
+			-- The option this button currently stands for is kept on OUR side:
+			-- an Instance rejects unknown members, so a button cannot carry a
+			-- custom field.
 			self:track(entry.MouseButton1Click:Connect(function()
-				currentDisplay = tostring(option)
+				local chosen = entryOption[index]
+				if chosen == nil then
+					return
+				end
+				currentDisplay = tostring(chosen)
 				button.Text = currentDisplay .. "  ▾"
 				if spec.path ~= nil then
-					local stored = option
+					local stored = chosen
 					if mapping ~= nil and mapping.toStore ~= nil then
-						stored = mapping.toStore(option)
+						stored = mapping.toStore(chosen)
 					end
 					self.store:set(spec.path, stored)
 				end
 				if spec.onSelect ~= nil then
-					task.spawn(spec.onSelect, option)
+					task.spawn(spec.onSelect, chosen)
+				end
+				if spec.silent ~= true then
+					self:toast(string.format("[%s] = %s", tostring(spec.label), tostring(chosen)), "info", 1.4)
 				end
 				closePanel()
 			end))
+			entries[index] = entry
 		end
+		entryOption[index] = option
+		entry.Text = tostring(option)
+		entry.LayoutOrder = index
+		entry.Visible = true
+		return entry
+	end
+
+	local function draw()
+		for index, option in ipairs(values) do
+			ensureEntry(index, option)
+		end
+		-- Surplus buttons are hidden, not destroyed: a shrinking list (machines
+		-- streaming out, players leaving) would otherwise churn them.
+		for index = #values + 1, #entries do
+			entries[index].Visible = false
+		end
+		drawn = true
 	end
 
 	local function place()
@@ -13171,12 +14401,17 @@ function Kit.dropdown(self, parent, spec)
 			return currentDisplay
 		end,
 		refresh = function(nextValues, nextDefault)
+			local changed = not sameValues(values, nextValues)
 			values = nextValues
 			if nextDefault ~= nil then
 				currentDisplay = tostring(nextDefault)
 				button.Text = currentDisplay .. "  ▾"
 			end
-			draw()
+			-- Only rebuild when the list actually moved, and only if it has been
+			-- built at least once (otherwise it will be built on open).
+			if changed and drawn then
+				draw()
+			end
 		end,
 		--[[
 			Show a value without re-declaring the option list.
@@ -13510,7 +14745,6 @@ local MAX_COVERAGE = 90
 local TOP_BAR_HEIGHT = 50
 local NAV_WIDTH = 120
 local TOP_BUTTON_ZONE = 130
-local MORPH_COVER_TIME = 0.14
 
 -- The three shapes' sizes and layers live in core/ShellState, so the pure state
 -- table is the single source of truth for them. Re-declaring the numbers here is
@@ -13674,12 +14908,51 @@ function Shell.applyVisualState(self, state)
 	end
 end
 
-function Shell.applySize(self)
-	-- Uses the same state function as the shape changes, so a width/scale edit
-	-- while minimised or in the pill keeps that shape's own layout instead of
-	-- falling back to the window size.
-	Shell.applyVisualState(self, Shell.visualState(self))
-	self.mainScale.Scale = ((self.store:get("uiState.uiScale") or 100) / 100) * Shell.resFactor()
+function Shell.applySize(self, instant)
+	--[[
+		A size change is ANIMATED unless the caller says otherwise.
+
+		`applySize` runs at build (where there is nothing to animate from) and on
+		every width/height/scale edit (where the user is dragging a slider and
+		expects to SEE the window follow). Writing `Size` directly in both cases
+		is why resizing looked like a jump cut next to morphs that tween.
+
+		The `instant` path is used by build and by anything that must land before
+		layout is read (the reset button, which then measures the result).
+	]]
+	local state = Shell.visualState(self)
+	local targetScale = ((self.store:get("uiState.uiScale") or 100) / 100) * Shell.resFactor()
+	if instant then
+		Shell.applyVisualState(self, state)
+		self.mainScale.Scale = targetScale
+	else
+		--[[
+			A size edit CANCELS a shape change that is still in flight.
+
+			`morph` re-applies its end state (via `applyVisualState`) when it lands,
+			and that write is a hard `Size` assignment -- so a width/scale edit
+			during those ~0.25 s would be overwritten and the window would jump.
+			Taking a new morph sequence number here makes the OLDER chain stand
+			down; both compute from `Shell.visualState`, so the state the layers
+			were just set to and the size that lands are the same shape.
+		]]
+		self.morphSeq += 1
+		self.kit:tween(self.main, 0.2, {
+			Size = UDim2.fromOffset(state.layout.width, state.layout.height),
+		}, Enum.EasingStyle.Quint)
+		self.kit:tween(self.mainCorner, 0.2, { CornerRadius = UDim.new(0, state.layout.corner) },
+			Enum.EasingStyle.Quint)
+		-- The internal scale is animated too: "整体缩放" is the one slider whose
+		-- whole effect IS a size change, and snapping it made the control feel
+		-- different from every other one on the page.
+		self.kit:tween(self.mainScale, 0.2, { Scale = targetScale }, Enum.EasingStyle.Quint)
+		-- The layers do not change here: a width/height edit while minimised or
+		-- in the pill keeps that shape (see ShellState.compute).
+		applyLayers(self, state.layers)
+		if self.onVisualState ~= nil then
+			pcall(self.onVisualState, state)
+		end
+	end
 
 	if self.syncSliders ~= nil then
 		self.syncSliders()
@@ -13695,7 +14968,7 @@ function Shell.applySize(self)
 		what the user chose, and silently rewriting it because they resized the
 		window would lose their placement. Only a DRAG persists (see bindDrag).
 	]]
-	self:delay(0.05, function()
+	self:delay(if instant then 0.05 else 0.26, function()
 		if self.destroyed then
 			return
 		end
@@ -14037,17 +15310,33 @@ function Shell.build(self)
 	kit:pad(status, 0, 0, 8, 8)
 	self.status = status
 
+	--[[
+		ORDER MATTERS, and this is not cosmetic.
+
+		`bindStore` subscribes the SHELL to `uiState.theme`, and the theme page
+		subscribes to the same key from inside `buildPages`. Subscribers run in
+		registration order, so building the pages FIRST meant:
+
+		    page render (sets every theme button to its new palette colour)
+		    -> Shell.setTheme -> Theme.apply (re-tweens all of them, over 0.38 s)
+
+		and the page's own assertions were the ones that got overwritten -- one of
+		the ways "选择主题后仍然残存绿色" appeared. Subscribing the shell first makes
+		the recolor happen first and the page's render the last word on its own
+		buttons.
+	]]
+	Shell.bindStore(self)
 	Shell.buildNavigation(self)
 	Shell.buildPages(self)
 	Shell.bindDrag(self, topBar)
 	Shell.bindInput(self)
-	Shell.bindStore(self)
 	Shell.bindButtons(self, minimizeButton, pillButton, closeButton)
 	Shell.bindHotkeys(self)
 	Shell.buildResetButton(self, screen)
 	Shell.bindStatus(self)
 
-	Shell.applySize(self)
+	-- Instant: at build there is no previous size to animate from.
+	Shell.applySize(self, true)
 	if #self.pages > 0 then
 		-- Select the first page unconditionally. The minimised state hides the
 		-- layers; it does not change which tab is selected. (The original wrote
@@ -14060,6 +15349,17 @@ function Shell.build(self)
 		Shell.setMinimized(self, true, true)
 	end
 
+	--[[
+		THE WINDOW'S ENTRANCE.
+
+		"只要任何 UI 大小发生变化，或者窗口出现消失等，都必须要有动画" -- a
+		window that blinks into existence at full size is the one motion the
+		interface was still missing (the legacy script had none either). A short
+		Back-eased scale-up from 92% is enough to read as "it opened" without
+		moving the layout: the transform is the UIScale, so nothing reflows.
+	]]
+	Shell.playEntrance(self)
+
 	if self.timers ~= nil and #self.uiTicks > 0 then
 		self.timers:every(os.clock(), 0.5, function()
 			for _, tick in ipairs(self.uiTicks) do
@@ -14069,6 +15369,46 @@ function Shell.build(self)
 	end
 
 	return screen
+end
+
+-- [[ Scale the window up from 92% on load. See the call site for why. ]]
+function Shell.playEntrance(self)
+	if self.mainScale == nil then
+		return
+	end
+	local target = self.mainScale.Scale
+	if target <= 0.01 then
+		return
+	end
+	self.mainScale.Scale = target * 0.92
+	self.kit:tween(self.mainScale, 0.32, { Scale = target }, Enum.EasingStyle.Back)
+end
+
+--[[
+	Close the window with a motion, then hand off to `onClose`.
+
+	The confirm dialog used to call `onClose` directly, which destroyed the
+	ScreenGui between one frame and the next -- a hard cut with no exit at all.
+	The shrink lands first, then the teardown runs.
+]]
+function Shell.closeAnimated(self)
+	if self.closing then
+		return
+	end
+	self.closing = true
+	local target = self.mainScale.Scale
+	self.kit:tween(self.mainScale, 0.22, { Scale = target * 0.88 }, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+	if self.cover ~= nil then
+		self.cover.BackgroundColor3 = self.kit:color("Bg")
+		self.cover.Visible = true
+		self.cover.BackgroundTransparency = 1
+		self.kit:tween(self.cover, 0.22, { BackgroundTransparency = 0 })
+	end
+	self:delay(0.24, function()
+		if self.onClose ~= nil then
+			task.spawn(self.onClose)
+		end
+	end)
 end
 
 function Shell.buildNavigation(self)
@@ -14300,72 +15640,105 @@ function Shell.bindDrag(self, handle)
 end
 
 --[[
-	Change shape behind a cover.
+	Change the window's shape -- VISIBLY.
 
-	`onCovered` runs while the window is invisible, so nothing is ever caught
-	half-swapped.
+	The user's complaint was "我点最小化和最大化按钮没有动画，没有那种变大变小的
+	动画". Both the legacy script and the refactor did animate, but they animated
+	BEHIND an opaque white cover: the cover faded in over 0.13 s, the shell's
+	Size/Position/CornerRadius tweened where nobody could see it, and the cover
+	faded out again. The net effect on screen is a white flash and a window that
+	was already the new size -- which is exactly "没有动画".
 
-	Every morph takes a new sequence number and each delayed step bails out when a
-	newer morph has started. Without that, clicking minimise/restore quickly left
-	two overlapping delay chains; whichever finished last decided the final size,
-	corner and visibility, and the window visibly flickered through both shapes.
+	So the motion is now the thing you see:
+
+	  * the shell's `Size`/`Position`/`CornerRadius` tween directly (Quint, as the
+	    legacy `morphShell` did);
+	  * the layers that must SURVIVE the transition (`before`) are made visible
+	    first, so `main.ClipsDescendants` reveals them progressively as the window
+	    grows -- that clipping is what makes the growth read as growth;
+	  * the layers that must be GONE at rest are switched off only after the
+	    motion lands (`onCovered`), so nothing pops mid-tween;
+	  * the window is re-clamped onto the screen at the end. That is the reported
+	    "最小化后把标题栏拖到最上面，再最大化，UI 卡在屏幕外" -- a 50 px bar fits
+	    anywhere, and growing it back from y≈0 pushed half of it out of the
+	    viewport with nothing to bring it back, because `clampOnScreen` was only
+	    wired to dragging and viewport changes.
+
+	`morphSeq` still guards against overlapping chains: every delayed step bails
+	out when a newer morph has started, so a fast minimise -> restore -> minimise
+	cannot leave two chains fighting over the same properties.
 ]]
 function Shell.morph(self, options)
 	self.morphSeq += 1
 	local seq = self.morphSeq
-	-- Stamped so the watchdog below can tell "a morph is in flight" from
-	-- "a morph died and left the cover up".
 	self.morphAt = os.clock()
+	local move = options.move or 0.22
 
-	local cover = self.cover
-	if cover ~= nil then
-		cover.BackgroundColor3 = self.kit:color("White")
-		cover.BackgroundTransparency = 1
-		cover.Visible = true
-		self.kit:tween(cover, MORPH_COVER_TIME, { BackgroundTransparency = 0 })
+	if options.before ~= nil then
+		pcall(options.before)
 	end
-	self:delay(MORPH_COVER_TIME, function()
+
+	if options.corner ~= nil then
+		self.kit:tween(self.mainCorner, move, { CornerRadius = UDim.new(0, options.corner) }, Enum.EasingStyle.Quint)
+	end
+
+	local props = {}
+	if options.size ~= nil then
+		props.Size = options.size
+	end
+	if options.position ~= nil then
+		props.Position = options.position
+	end
+	self.kit:tween(self.main, move, props, Enum.EasingStyle.Quint)
+
+	self:delay(move + 0.02, function()
 		if self.destroyed or self.morphSeq ~= seq then
 			return
 		end
 		if options.onCovered ~= nil then
 			pcall(options.onCovered)
 		end
-		if options.corner ~= nil then
-			self.kit:tween(self.mainCorner, options.move, { CornerRadius = UDim.new(0, options.corner) }, Enum.EasingStyle.Quint)
-		end
-		local props = {}
-		if options.size ~= nil then
-			props.Size = options.size
-		end
-		if options.position ~= nil then
-			props.Position = options.position
-		end
-		self.kit:tween(self.main, options.move, props, Enum.EasingStyle.Quint)
-		self:delay(options.move, function()
+		self.morphAt = 0
+		-- Absolute* are only meaningful once the new size has propagated, so the
+		-- clamp gets its own beat. `clampOnScreen` returns true when it had to
+		-- move the window; there is nothing to persist here (a morph is not a
+		-- user-chosen position), so the result is only used for the reveal.
+		self:delay(0.06, function()
 			if self.destroyed or self.morphSeq ~= seq then
 				return
 			end
-			self.kit:tween(cover, options.fadeOut, { BackgroundTransparency = 1 })
-			self:delay(options.fadeOut + 0.03, function()
-				-- The cover is only hidden by the morph that still owns it; a
-				-- superseded chain must not uncover an in-flight newer one.
-				if self.morphSeq ~= seq then
-					return
-				end
-				pcall(function()
-					cover.Visible = false
-					cover.BackgroundTransparency = 1
-				end)
-				self.morphAt = 0
-				-- The window is fully visible again, so anything that only makes
-				-- sense once it is revealed happens here.
-				if options.onRevealed ~= nil then
-					pcall(options.onRevealed)
-				end
-			end)
+			Shell.clampOnScreen(self)
+			if options.onRevealed ~= nil then
+				pcall(options.onRevealed)
+			end
 		end)
 	end)
+end
+
+--[[
+	Fade the pill's own contents.
+
+	The pill is a mode of the same window, so entering it has to look like the
+	window collapsing ONTO its label rather than a bare rectangle appearing.
+	Legacy V1007 called exactly this `setPillContent(alpha, time)` over the three
+	bars, the title, the live line and the status dot; the refactor toggled
+	`pillLayer.Visible` in one frame, which is why the pill looked pasted on.
+]]
+function Shell.setPillContent(self, alpha, time)
+	local duration = time or 0.18
+	local transparency = math.clamp(alpha, 0, 1)
+	for _, bar in ipairs(self.pillBars or {}) do
+		self.kit:tween(bar, duration, { BackgroundTransparency = transparency })
+	end
+	if self.pillTitle ~= nil then
+		self.kit:tween(self.pillTitle, duration, { TextTransparency = transparency })
+	end
+	if self.pillLive ~= nil then
+		self.kit:tween(self.pillLive, duration, { TextTransparency = transparency })
+	end
+	if self.pillDot ~= nil then
+		self.kit:tween(self.pillDot, duration, { BackgroundTransparency = math.min(1, transparency + 0.1) })
+	end
 end
 
 --[[
@@ -14396,10 +15769,26 @@ function Shell.setMinimized(self, minimized, instant)
 	end
 
 	Shell.morph(self, {
-		move = 0.22,
-		fadeOut = 0.16,
+		move = 0.24,
 		size = UDim2.fromOffset(state.layout.width, state.layout.height),
 		corner = state.layout.corner,
+		--[[
+			RESTORING has to make the layers visible BEFORE the window grows:
+			`main.ClipsDescendants` is what turns "these are visible" into "they
+			are revealed as the window passes over them". Doing it afterwards
+			would pop them into an already-grown window.
+		]]
+		before = function()
+			if self.nav ~= nil then
+				self.nav.Visible = true
+			end
+			if self.content ~= nil then
+				self.content.Visible = true
+			end
+			if self.topFill ~= nil then
+				self.topFill.Visible = true
+			end
+		end,
 		onCovered = function()
 			Shell.applyVisualState(self, state)
 		end,
@@ -14433,12 +15822,32 @@ function Shell.setPill(self, enabled)
 
 	Shell.morph(self, {
 		move = if enabled then 0.26 else 0.28,
-		fadeOut = if enabled then 0.14 else 0.18,
 		size = UDim2.fromOffset(state.layout.width, state.layout.height),
 		corner = state.layout.corner,
 		position = position,
+		before = function()
+			if enabled then
+				-- Collapsing onto the pill: the label fades IN while the box
+				-- shrinks around it.
+				self.pillLayer.Visible = true
+				Shell.setPillContent(self, 1, 0.02)
+				Shell.setPillContent(self, 0, 0.24)
+			else
+				-- Growing back: the window's layers have to be visible for the
+				-- growth to reveal them, and the pill label fades out.
+				self.topBar.Visible = true
+				self.nav.Visible = true
+				self.content.Visible = true
+				self.status.Visible = true
+				self.topFill.Visible = self.minimized ~= true
+				Shell.setPillContent(self, 1, 0.16)
+			end
+		end,
 		onCovered = function()
 			Shell.applyVisualState(self, state)
+			if not enabled and self.pillLayer ~= nil then
+				self.pillLayer.Visible = false
+			end
 		end,
 		-- Coming back from the pill re-pops the active page, like V1007 did;
 		-- going INTO the pill has nothing to pop.
@@ -14465,12 +15874,41 @@ function Shell.setTheme(self, name)
 	local changed = Theme.apply(self.screen, remap)
 	self.kit.theming = false
 	self.store:set("uiState.theme", name)
+
+	--[[
+		SECOND PASS, and then the settle signal.
+
+		A widget caught mid-tween (a button the pointer just left, a card still
+		popping in) is not sitting on a palette value, so the first pass has to
+		match it within a tolerance and can miss. Legacy V1007 re-ran its whole
+		repaint 0.55 s later for exactly this reason. Here the second pass is a
+		SNAP (duration 0): by then the first pass has landed, so any widget still
+		off-palette is one a tween is actively holding, and snapping it is what
+		actually removes the residue rather than nudging it.
+
+		`uiState.themeEpoch` is then bumped so pages that own colours the remap
+		cannot reach (the theme page's own selected marker) can re-assert them
+		after the repaint instead of racing it.
+	]]
+	self:delay(Theme.RECOLOR_TIME + 0.12, function()
+		if self.destroyed then
+			return
+		end
+		self.kit.theming = true
+		Theme.apply(self.screen, remap, 0)
+		self.kit.theming = false
+		self.store:set("uiState.themeEpoch", (tonumber(self.store:get("uiState.themeEpoch")) or 0) + 1)
+		if self.onThemeSettled ~= nil then
+			pcall(self.onThemeSettled)
+		end
+	end)
+
 	--[[
 		Persist the theme immediately.
 
-		The autosave fires every 8 seconds and would get there eventually, but a
-		theme is a visible choice the user just made: if the session ends (crash,
-		kick, rejoin) inside that window, the choice is lost. V1007 saved from the
+		The autosave fires on a timer and would get there eventually, but a theme
+		is a visible choice the user just made: if the session ends (crash, kick,
+		rejoin) inside that window, the choice is lost. V1007 saved from the
 		theme handler for the same reason.
 	]]
 	if self.services.persist ~= nil then
@@ -14650,9 +16088,8 @@ function Shell.bindButtons(self, minimizeButton, pillButton, closeButton)
 
 	kit:track(closeButton.MouseButton1Click:Connect(function()
 		Shell.confirm(self, "关闭确认", "确定要关闭脚本吗？", function()
-			if self.onClose ~= nil then
-				task.spawn(self.onClose)
-			end
+			-- Animated exit, then teardown: see Shell.closeAnimated.
+			Shell.closeAnimated(self)
 		end)
 	end))
 end
@@ -14883,8 +16320,11 @@ function Shell.resetLayout(self)
 	store:set("uiState.savedInfo", { xs = 0.5, xo = 0, ys = 0.5, yo = 0 })
 	store:set("uiState.savedInfoSize", { xs = 0, xo = 320, ys = 0, yo = 470 })
 
-	local center = UDim2.new(0.5, 0, 0.5, 0)
-	self.main.Position = center
+	-- The centre is reached by WRITING THE STORE, not by assigning `Position`:
+	-- the subscriber in `bindStore` tweens the window there, so the reset is
+	-- animated like every other move instead of teleporting. Assigning directly
+	-- also made that subscriber a no-op ("already at the target"), which is how
+	-- the jump went unnoticed.
 	store:set("uiState.savedMain", { xs = 0.5, xo = 0, ys = 0.5, yo = 0 })
 	self.pillPosition = UDim2.new(0.5, 0, 0.18, 0)
 
@@ -14912,17 +16352,15 @@ function Shell.bindStatus(self)
 		--[[
 			Stuck-cover watchdog.
 
-			The cover is a full-window opaque frame. If a morph chain is
-			superseded at the wrong moment, or its delayed step is dropped (a timer
-			cancelled by teardown, a `pcall` that swallowed a failure), the cover
-			stays up and the entire interface is a white rectangle -- with the
-			click-through controls still working underneath, which makes it look
-			like a rendering bug rather than a state bug.
+			The cover is a full-window opaque frame, used only by the CLOSE
+			animation now (shape changes tween the shell itself -- see
+			Shell.morph). If its delayed step is dropped, the entire interface is a
+			flat rectangle with the controls still live underneath, which reads as
+			a rendering bug rather than a state bug.
 
-			V1007 guarded this from its heartbeat (`:4708-4714`). The check is
-			deliberately generous: a legitimate morph finishes in well under a
-			second (cover 0.16 + move 0.28 + fade 0.18), so anything still covered
-			after 2 s is not a morph.
+			V1007 guarded the equivalent from its heartbeat (`:4708-4714`). The
+			check is deliberately generous: a legitimate close is over in 0.24 s,
+			so anything still covered after 2 s is not a close in progress.
 		]]
 		if self.cover ~= nil and self.cover.Visible == true then
 			local since = if self.morphAt ~= nil and self.morphAt > 0 then os.clock() - self.morphAt else 999
@@ -15372,6 +16810,8 @@ function Toast.new(context)
 		layout = nil,
 		sequence = 0,
 		live = {},
+		-- key -> { card, timer, at }. See COALESCE_SECONDS.
+		byKey = {},
 	}, Toast)
 	return self
 end
@@ -15447,6 +16887,40 @@ function Toast.show(self, text, kind, duration)
 	end
 	local holder = Toast.ensureHolder(self)
 	local kit = self.kit
+	local message = tostring(text)
+
+	--[[
+		Coalesce: the same message, still on screen, is refreshed rather than
+		duplicated. This is what makes a slider that notifies on release and a
+		toggle that notifies on click safe to notify at all -- without it the
+		"many notifications disappeared" complaint would just become "the screen
+		is full of notifications".
+	]]
+	local key = tostring(kind) .. "\n" .. message
+	local existing = self.byKey[key]
+	if existing ~= nil and existing.card ~= nil and existing.card.Parent ~= nil then
+		existing.at = os.clock()
+		if existing.timer ~= nil then
+			existing.timer:cancel()
+		end
+		local accent = existing.accent
+		if accent ~= nil and accent.Parent ~= nil then
+			accent.Size = UDim2.new(0, 4, 1, -12)
+			kit:tween(accent, lifetime, { Size = UDim2.new(0, 4, 0, 0) }, Enum.EasingStyle.Linear)
+		end
+		local label = existing.label
+		if label ~= nil and label.Parent ~= nil then
+			label.Text = message
+			label.TextTransparency = 0
+		end
+		existing.timer = self:delay(lifetime, function()
+			self.byKey[key] = nil
+			if existing.retire ~= nil then
+				existing.retire()
+			end
+		end)
+		return existing.card
+	end
 
 	self.sequence += 1
 	local card = kit:instance("Frame", {
@@ -15474,7 +16948,7 @@ function Toast.show(self, text, kind, duration)
 		Position = UDim2.fromOffset(16, 0),
 		BackgroundTransparency = 1,
 		Font = Enum.Font.GothamMedium,
-		Text = tostring(text),
+		Text = message,
 		TextColor3 = kit:color("TextPrimary"),
 		TextSize = 13,
 		TextWrapped = true,
@@ -15492,6 +16966,8 @@ function Toast.show(self, text, kind, duration)
 	kit:tween(accent, lifetime, { Size = UDim2.new(0, 4, 0, 0) }, Enum.EasingStyle.Linear)
 
 	table.insert(self.live, card)
+
+	local record = { card = card, accent = accent, label = label, at = os.clock(), timer = nil }
 
 	local function retire()
 		if card.Parent == nil then
@@ -15513,13 +16989,21 @@ function Toast.show(self, text, kind, duration)
 					table.remove(self.live, index)
 				end
 			end
+			if self.byKey[key] == record then
+				self.byKey[key] = nil
+			end
 			pcall(function()
 				card:Destroy()
 			end)
 		end)
 	end
+	record.retire = retire
+	self.byKey[key] = record
 
-	self:delay(lifetime, retire)
+	record.timer = self:delay(lifetime, function()
+		self.byKey[key] = nil
+		retire()
+	end)
 
 	-- Cap the stack: over five cards, or taller than 80% of the screen, retire the
 	-- oldest rather than letting toasts cover the game.
@@ -15555,6 +17039,7 @@ function Toast.destroy(self)
 		self.holder = nil
 	end
 	table.clear(self.live)
+	table.clear(self.byKey)
 end
 
 return Toast
@@ -15799,9 +17284,15 @@ function InfoWindow.new(context)
 		rows = {},
 		viewing = nil,
 		visible = false,
-		-- True while the main window is collapsed or in pill mode. Independent of
-		-- `visible`, which is the user's intent (see applyVisibility).
-		shellHidden = false,
+		--[[
+			The main window's SHAPE, not a pre-computed "hide me" boolean.
+
+			Keeping the mode (rather than the answer) is what lets the setting
+			below be flipped while the window is already collapsed, and it keeps
+			the two questions separate: `visible` is the user's intent,
+			`shellMode` is what the main window is doing.
+		]]
+		shellMode = "window",
 		lastRefresh = 0,
 	}, InfoWindow)
 	return self
@@ -16171,6 +17662,13 @@ function InfoWindow.build(self)
 
 	self.timers = timers
 
+	-- Flipping "最小化时隐藏信息窗" while the main window is ALREADY collapsed has
+	-- to take effect immediately; without this the setting would only apply on
+	-- the next shape change.
+	kit:track(self.store:subscribe("uiState.infoHideWithShell", function()
+		InfoWindow.applyVisibility(self)
+	end))
+
 	--[[
 		Honour a visibility request that arrived BEFORE the frame existed.
 
@@ -16238,15 +17736,29 @@ end
 
 	Kept separate from `frame.Visible` because the two are different questions
 	and conflating them is a bug: `visible` is "the user wants this open", while
-	the frame is only visible when the user wants it AND the main window is not
-	collapsed. Writing the user's intent over the top of a collapse would reopen
-	the panel on top of a minimised window.
+	the frame is only visible when the user wants it AND (if the setting says so)
+	the main window is not collapsed. Writing the user's intent over the top of a
+	collapse would reopen the panel on top of a minimised window.
 ]]
 function InfoWindow.applyVisibility(self)
 	if self.frame == nil then
 		return
 	end
-	local open = self.visible and self.shellHidden ~= true
+	--[[
+		DEFAULT: the panel SURVIVES minimising and the pill.
+
+		The user's wording is the spec -- the panel "does not disappear with the
+		main panel's minimise/pill, unless the player closed it themselves". That
+		is also what the panel is for: collapsing the main window is how you get
+		it out of the way while KEEPING the read-outs on screen. The opposite
+		behaviour is one switch away (`uiState.infoHideWithShell`).
+	]]
+	local collapsed = self.shellMode == "minimized" or self.shellMode == "pill"
+	local hidden = collapsed and self.store:get("uiState.infoHideWithShell") == true
+	local open = self.visible and not hidden
+	if self.frame.Visible == open then
+		return
+	end
 	self.frame.Visible = open
 	if open and self.timers ~= nil then
 		InfoWindow.refresh(self)
@@ -16256,16 +17768,16 @@ end
 --[[
 	Called by the Shell whenever the main window changes shape (minimise, pill).
 
-	Collapsed and pill modes hide the panel; the window mode restores it only if
-	the user had it open -- minimise then restore must not conjure a panel the
-	user had closed, and must not lose one they had open.
+	Collapsing hides the panel only when the setting says it should; the window
+	mode restores it if the user had it open -- minimise then restore must not
+	conjure a panel the user had closed, and must not lose one they had open.
 ]]
-function InfoWindow.setShellHidden(self, hidden)
-	hidden = hidden == true
-	if self.shellHidden == hidden then
+function InfoWindow.setShellMode(self, mode)
+	local next = if mode == "minimized" or mode == "pill" then mode else "window"
+	if self.shellMode == next then
 		return
 	end
-	self.shellHidden = hidden
+	self.shellMode = next
 	InfoWindow.applyVisibility(self)
 end
 
@@ -16993,9 +18505,56 @@ Page.build = function(kit, page, shell)
 		max = 2000,
 		default = 20,
 		hint = "每秒发包次数（1~2000）",
+		--[[
+			LOCKED WHILE A CONTROLLER OWNS THE NUMBER.
+
+			The user's report: "当我打开帧率自适应时，你这个频率还可以自己调整，
+			还会抢线". Two things were writing one value -- the manual box and the
+			adaptive scaler -- so whichever ran last won, and the number on screen
+			stopped describing what was being sent. The box is now read-only and
+			says who took over.
+		]]
+		watch = "train.adaptive",
+		watch2 = "train.eventAdaptive",
+		locked = function()
+			if kit.store:get("train.eventAdaptive") == true then
+				return true, "自适应发包已接管：频率由延迟探测自动决定"
+			end
+			if kit.store:get("train.adaptive") == true then
+				return true, "帧率自适应已接管：频率随帧率自动缩放"
+			end
+			return false, nil
+		end,
 	})
 	kit:divider(basics)
-	kit:toggle(basics, { label = "根据帧率自适应", path = "train.adaptive" })
+	--[[
+		帧率自适应 and 自适应发包 are two answers to the same question, so only one
+		may be armed. Switching the probing mode on CLEARS the frame-rate mode (and
+		the lock above keeps it clear), rather than leaving a lit switch that does
+		nothing -- "即使打开了触发器它仍然是不执行的" is only acceptable if the
+		control says so instead of pretending.
+	]]
+	kit:track(kit.store:subscribe("train.eventAdaptive", function(_, value)
+		if value ~= true then
+			return
+		end
+		if kit.store:get("train.adaptive") == true then
+			kit.store:set("train.adaptive", false)
+			shell:toast("已屏蔽帧率自适应（两者互斥）", "warn")
+		end
+	end))
+
+	kit:toggle(basics, {
+		label = "根据帧率自适应",
+		path = "train.adaptive",
+		watch = "train.eventAdaptive",
+		locked = function()
+			if kit.store:get("train.eventAdaptive") == true then
+				return true, "已被「自适应发包」屏蔽"
+			end
+			return false, nil
+		end,
+	})
 	kit:slider(basics, {
 		label = "目标帧率",
 		path = "train.adaptiveThresh",
@@ -17005,6 +18564,47 @@ Page.build = function(kit, page, shell)
 		commitOnly = true,
 	})
 	kit:input(basics, { label = "自适应上限", path = "train.adaptiveMax", min = 100, max = 50000, default = 5000 })
+
+	--[[
+		ADAPTIVE PACING ("根据事件自适应发包").
+
+		Instead of a number the user has to guess, this probes: it starts low,
+		raises the rate while the measured latency stays under the target, and
+		halves on the first breach. "As fast as the connection will take, without
+		making the ping worse."
+	]]
+	kit:toggle(basics, {
+		label = "自适应发包（按延迟自调节）",
+		path = "train.eventAdaptive",
+		hint = "开启后屏蔽帧率自适应并锁定手动频率：从低速率开始探测，延迟升高自动降速",
+	})
+	kit:slider(basics, {
+		label = "目标延迟上限 ms",
+		path = "train.eventPingTarget",
+		min = 40,
+		max = 1000,
+		default = 150,
+		commitOnly = true,
+		hint = "超过这个延迟就降速；低于它才继续加压",
+	})
+
+	-- A read-out, not a control: which pacing mode resolved, and to what.
+	local rateLabel = kit:instance("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 20),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamMedium,
+		Text = "实际发包 -",
+		TextColor3 = kit:color("TextSecond"),
+		TextSize = 12,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		LayoutOrder = kit:nextOrder(basics),
+	}, basics)
+	shell:addUiTick(function()
+		local rate = tonumber(kit.store:get("train.effRate")) or 0
+		local source = tostring(kit.store:get("train.rateSource") or "")
+		rateLabel.Text = string.format("实际发包 %d /s · 来源 %s", rate, source)
+		rateLabel.TextColor3 = if rate > 0 then kit:color("Green") else kit:color("TextMuted")
+	end)
 
 	kit:section(page, "训练工具")
 	local tools = kit:card(page)
@@ -17197,28 +18797,47 @@ Page.build = function(kit, page, shell)
 		},
 	})
 
-	-- Keep the name list current. The seats are streamed in as the player moves,
-	-- so a list built once at page build is empty for anyone not standing in a
-	-- gym at that moment -- which is why "器械名" had nothing to choose from.
-	-- This is what the page note has always claimed ("列表每 2 秒重新扫描一次").
+	--[[
+		Keep the name list current. The seats are streamed in as the player moves,
+		so a list built once at page build is empty for anyone not standing in a
+		gym at that moment -- which is why "器械名" had nothing to choose from.
+
+		Polled every 6 s rather than every 2 s: each pass asks game/Machine for the
+		seat list, which walks `machinesFolder` when its own 2 s cache has expired.
+		The dropdown itself no longer rebuilds its buttons unless the list actually
+		changed (see Kit.dropdown), so the remaining cost was the scan -- and a
+		machine appearing three seconds later is not something a human notices.
+	]]
 	local timers = shell.timers
 	if timers ~= nil then
-		timers:every(os.clock(), 2, function()
+		timers:every(os.clock(), 6, function()
 			refreshMachines(false)
 		end)
 	else
-		kit:delay(2, function()
+		kit:delay(6, function()
 			refreshMachines(false)
 		end)
 	end
 
-	kit:note(machines, "多人同器械时会自动换一台空闲的；列表每 2 秒重新扫描一次")
+	kit:note(machines, "多人同器械时会自动换一台空闲的；列表每 6 秒重新扫描一次")
 	refreshMachines(true)
 
 	kit:section(page, "锻炼时机")
 	local timing = kit:card(page)
 	kit:toggle(timing, { label = "杀戮时同时锻炼", path = "train.duringKill" })
 	kit:toggle(timing, { label = "打 Boss 时同时锻炼", path = "train.duringBoss" })
+	--[[
+		THE TOOL HAND IS ARBITRATED, AND THE PACING IS EXPLAINED HERE.
+
+		Training and punching cannot both hold the tool, so while they overlap the
+		hand alternates between the glove and the training tool on ONE symmetric
+		dwell (`杀戮 → 双工具切换间隔`). This note exists because the previous
+		behaviour was an asymmetry the user had to diagnose themselves: the glove
+		was re-equipped on every punch (up to 120x/s) while the training tool was
+		offered once per 0.05 s flip, so training never held the tool long enough
+		to register a rep.
+	]]
+	kit:note(timing, "同时锻炼时，拳套与训练工具按「杀戮 → 双工具切换间隔」轮流持握，两半时间相同")
 	kit:toggle(timing, {
 		label = "找不到工具时自动重生",
 		path = "cfg.autoSuicide",
@@ -17380,7 +18999,7 @@ Page.build = function(kit, page, shell)
 	kit:toggle(points, {
 		label = "循环传送",
 		path = "tp.loop",
-		hint = "反复把角色送到所选传送点；与自动前往肌肉之王互斥",
+		hint = "反复把角色送到所选传送点；与自动前往肌肉之王互斥，打 Boss 时会自动让位",
 	})
 
 	--[[
@@ -17720,6 +19339,59 @@ Page.build = function(kit, page, shell)
 		hint = "需要同时开着「循环前往肌肉之王」",
 	})
 	kit:toggle(extras, { label = "杀戮时切换训练工具（双工具）", path = "kill.dualEnabled" })
+	--[[
+		THE DWELL EACH HAND KEEPS THE TOOL.
+
+		One number for BOTH halves, so the swap rates are equal by construction --
+		the user's "工具切换速度要两两齐平". Too short and neither a rep nor a
+		punch lands; too long and one side starves.
+	]]
+	kit:slider(extras, {
+		label = "双工具切换间隔（秒）",
+		path = "kill.dualInterval",
+		min = 0.1,
+		max = 3,
+		default = 0.6,
+		commitOnly = true,
+		hint = "每个半程持握工具的时长；两半相同",
+	})
+
+	--[[
+		THE PRIORITY LADDER, written down where it is decided.
+
+		It is enforced in three places (Boss > everything in the teleport and kill
+		gates, 全图杀戮 > 单独击杀 in the selection, and everything > 器械 via the
+		arbiter's `damage` hold), which is exactly why it needs to be stated once
+		in the interface instead of being rediscovered by trying combinations.
+	]]
+	kit:note(extras, "优先级：打 Boss > 全图杀戮 > 单独击杀 / 肌肉之王 > 器械；高优先级运行时会自动让位")
+
+	kit:section(page, "贴身方式")
+	local approach = kit:card(page)
+	--[[
+		THE OVERHEAD APPROACH.
+
+		The user asked for the boss fight's geometry on player targets, because a
+		punch thrown from the target's own height flies over its shoulder: "保证
+		拳头一定打到对面身上". The default is deliberately small (12 studs, about a
+		body) rather than the boss's 70 -- for a player-sized hitbox the target has
+		to stay inside the game's punch reach, and being higher only makes the
+		downward tilt look more dramatic while the punch lands nowhere.
+	]]
+	kit:slider(approach, {
+		label = "悬停高度（格）",
+		path = "kill.hoverHeight",
+		min = 1,
+		max = 200,
+		default = 12,
+		commitOnly = true,
+		hint = "站在目标上方多少格；太高会超出拳击距离",
+	})
+	kit:toggle(approach, {
+		label = "俯视朝向（照打 Boss 的角度）",
+		path = "kill.lookDown",
+		hint = "关闭则平视目标，拳头容易从头顶飞过；打 Boss 也用这个开关",
+	})
 
 	kit:section(page, "单独击杀")
 	local single = kit:card(page)
@@ -17817,12 +19489,21 @@ Page.build = function(kit, page, shell)
 		reach a late joiner was to know to press 刷新玩家列表.
 
 		The stored selection is passed as `default` so a refresh never moves the
-		user's choice.
+		user's choice. It is throttled to 2 s rather than run on every UI tick
+		(the tick is 0.5 s): rebuilding the candidate list means walking
+		`Players:GetPlayers()`, allocating and sorting, and the Kit only SKIPS the
+		redraw when nothing changed -- the walk itself is not free.
 	]]
+	local lastPlayerScan = 0
 	shell:addUiTick(function()
 		if targetDropdown == nil then
 			return
 		end
+		local now = os.clock()
+		if now - lastPlayerScan < 2 then
+			return
+		end
+		lastPlayerScan = now
 		targetDropdown.refresh(playerNames(), targetDropdown.get())
 	end)
 	kit:note(single, "目标按名字记住，玩家重进后会重新绑定；不受搜索范围限制")
@@ -18001,6 +19682,24 @@ Page.build = function(kit, page, shell)
 
 	kit:section(page, "体型与宝箱")
 	local extra = kit:card(page)
+	--[[
+		HOW HIGH ABOVE THE BOSS THE FIGHT HOVERS.
+
+		This is the one number that decides whether the punches land: too low and
+		the boss's own attacks connect constantly, too high and the punch is out of
+		reach. 70 is the legacy constant (and what the reference implementation
+		uses); it is a control now because it is the first thing to try when
+		"开了自动打 Boss 却打不到".
+	]]
+	kit:slider(extra, {
+		label = "悬停高度（格）",
+		path = "boss.hoverHeight",
+		min = 1,
+		max = 200,
+		default = 70,
+		commitOnly = true,
+		hint = "站在 Boss 上方多少格；打不到就调低一点",
+	})
 	kit:toggle(extra, { label = "打 Boss 时调整体型", path = "boss.sizeEnabled" })
 	kit:slider(extra, {
 		label = "体型大小",
@@ -18364,8 +20063,44 @@ Page.build = function(kit, page, shell)
 		path = "perf.disabled",
 		hint = "会把已经做过的优化恢复回去",
 	})
-	kit:toggle(control, { label = "深度防卡顿（隐藏粒子 / 阴影）", path = "perf.antiLag" })
+	kit:toggle(control, { label = "深度防卡顿（总开关）", path = "perf.antiLag" })
+	--[[
+		WHAT "深度" ACTUALLY DOES.
+
+		The old pass hid particles and shadows only, which is why the user
+		reported it as "完全无效" -- on a big place the textures and the lighting
+		are the cost. Three independent, individually reversible groups now, all
+		on by default so the master switch keeps its promise.
+	]]
+	kit:toggle(control, {
+		label = "· 移除特效（粒子 / 光束 / 灯光 / 后处理）",
+		path = "perf.removeEffects",
+	})
+	kit:toggle(control, {
+		label = "· 移除纹理（贴花 / 纹理贴图）",
+		path = "perf.removeTextures",
+	})
+	kit:toggle(control, {
+		label = "· 渲染剔除（阴影 / 环境光照）",
+		path = "perf.cull",
+	})
 	kit:toggle(control, { label = "显示通知气泡", path = "cfg.toast" })
+	--[[
+		THE AUTOSAVE INTERVAL.
+
+		The requirement is "every 10 seconds, and once immediately when the script
+		is closed". The close-side save lives in `session.stop`; this is the
+		periodic half, exposed because the write is the expensive part.
+	]]
+	kit:slider(control, {
+		label = "自动保存间隔（秒）",
+		path = "cfg.saveSeconds",
+		min = 3,
+		max = 300,
+		default = 10,
+		commitOnly = true,
+		hint = "关闭脚本时无论如何都会立即保存一次",
+	})
 
 	kit:section(page, "操作与快捷键")
 	local hotkeys = kit:card(page)
@@ -18472,6 +20207,19 @@ Page.build = function(kit, page, shell)
 		label = "显示实时信息悬浮窗",
 		path = "uiState.infoVisible",
 		hint = "会自动避开主面板摆放；右下角可拖拽缩放",
+	})
+	--[[
+		Should collapsing the MAIN window also hide the info panel?
+
+		Default OFF, which is the user's stated behaviour: the panel stays up
+		through minimise and pill mode and is only removed by its own ✕. The switch
+		is the one-click answer for the opposite preference, so this is a choice
+		rather than an argument.
+	]]
+	kit:toggle(appearance, {
+		label = "最小化 / 药丸时隐藏信息窗",
+		path = "uiState.infoHideWithShell",
+		hint = "默认关闭：信息窗只有在你自己点 ✕ 时才消失",
 	})
 	kit:button(appearance, {
 		label = "重置窗口位置",
@@ -18649,28 +20397,32 @@ Page.build = function(kit, page, shell)
 		-- drives exists, and it is only ever CALLED after that assignment.
 		local slotDropdown
 
+		local function currentSlot()
+			local display = slotDropdown.get() or "1."
+			local index = tonumber(string.match(display, "^%d+")) or 1
+			return math.clamp(index, 1, Persist.SLOT_COUNT)
+		end
+
 		local function refreshSlots()
 			--[[
-				Rebuild the labels from disk.
+				Rebuild the labels from disk, and RE-SEED THE TRIGGER with the
+				label of the slot that is selected NOW.
 
-				There is no filesystem watcher, so the read-out would otherwise keep
-				showing whatever each slot held when the page was built. The dropdown
-				is re-seeded with its CURRENT text (not a reset label) so refreshing
-				does not silently move the selection back to slot 1.
+				This is the reported bug: refresh used to keep the trigger's old
+				text whenever the old text was no longer in the list -- and after
+				saving into an empty slot, the old text ("1. （空）") is exactly
+				what is no longer in the list. So the trigger kept saying the slot
+				was empty until you opened the panel a second time and clicked an
+				entry. Selecting by INDEX and taking that index's fresh label is
+				what makes one save update the display immediately.
 			]]
-			local selected = slotDropdown.get()
+			local index = currentSlot()
 			names = {}
-			for index = 1, Persist.SLOT_COUNT do
-				local label = Persist.slotLabel(index)
-				table.insert(names, string.format("%d. %s", index, label or "（空）"))
+			for position = 1, Persist.SLOT_COUNT do
+				local label = Persist.slotLabel(position)
+				table.insert(names, string.format("%d. %s", position, label or "（空）"))
 			end
-			for _, entry in ipairs(names) do
-				if entry == selected then
-					slotDropdown.refresh(names, selected)
-					return
-				end
-			end
-			slotDropdown.refresh(names)
+			slotDropdown.refresh(names, names[index] or names[1])
 		end
 
 		slotDropdown = kit:dropdown(slots, {
@@ -18692,11 +20444,6 @@ Page.build = function(kit, page, shell)
 			placeholder = "例如：锻炼配置",
 			default = "",
 		})
-
-		local function currentSlot()
-			local display = slotDropdown.get() or "1."
-			return tonumber(string.match(display, "^%d+")) or 1
-		end
 
 		local function saveCurrent()
 			local index = currentSlot()
@@ -18869,7 +20616,7 @@ Page.build = function(kit, page, shell)
 
 	-- The colour strip is rebuilt from the palette whenever the theme changes,
 	-- because these swatches have no colour in the remap to be found by.
-	kit:bind("uiState.theme", "light", function(name, initial)
+	local function renderSwatches(name, initial)
 		local roles = Theme.roles(name)
 		kit.roles = roles
 		for role, square in pairs(squares) do
@@ -18882,7 +20629,29 @@ Page.build = function(kit, page, shell)
 				end
 			end
 		end
-	end)
+	end
+
+	kit:bind("uiState.theme", "light", renderSwatches)
+
+	--[[
+		THE FINAL WORD ON THIS PAGE'S OWN COLOURS ("仍然残存绿色").
+
+		Switching themes repaints every colour in place, and a widget caught
+		mid-tween is not sitting on a palette value -- the tolerance matcher can
+		miss it, and the marker can end up holding the previous palette's green.
+		The shell re-runs its repaint after the tweens have landed and then bumps
+		`uiState.themeEpoch`; this is the page re-asserting its own colours at that
+		moment, with SNAPS rather than tweens, so nothing can overwrite them
+		afterwards.
+
+		It re-asserts EVERY button (not just the newly selected one) because the
+		residue is usually on a button the pointer has passed over.
+	]]
+	kit:track(kit.store:subscribe("uiState.themeEpoch", function()
+		local active = kit.store:get("uiState.theme")
+		render(active, true)
+		renderSwatches(active, true)
+	end))
 end
 
 return Page
@@ -19148,7 +20917,10 @@ Main.game = {
 	Train = Train,
 }
 
-Main.AUTOSAVE_SECONDS = 8
+-- How often the config is written. The EFFECTIVE interval is `cfg.saveSeconds`
+-- (default 10, user-settable); this constant is only the poll that honours it.
+-- See the autosave timer in Main.start.
+Main.SAVE_POLL_SECONDS = 1
 Main.METRICS_SECONDS = 5
 -- Interval for the explicit collectgarbage hint (V1007 used 120 s).
 Main.GC_SECONDS = 120
@@ -19179,6 +20951,15 @@ function Main.start()
 	Main.cleanupPrevious()
 
 	local toastRef = nil
+	--[[
+		NOTHING IS DROPPED BEFORE THE TOAST STACK EXISTS.
+
+		`toastRef` is nil for the whole boot: the stack needs the screen, and the
+		screen is built last. Every subsystem installed before that reported into
+		nothing -- which is part of the user's "很多东西的通知气泡消失了". Messages
+		raised during the boot are buffered here and flushed once the stack is up.
+	]]
+	local pendingToasts = {}
 
 	-- One place that turns a subsystem message into console output plus a toast.
 	-- Defined first because the early subsystems below already need it.
@@ -19202,11 +20983,16 @@ function Main.start()
 				where the caller is a scheduler tick, into the task being counted
 				as failed).
 			]]
-			if toastRef ~= nil then
-				local ok, err = pcall(Toast.show, toastRef, text, kind, duration)
-				if not ok then
-					warn("[MKUltraHUB][ui] toast failed: " .. tostring(err))
+			if toastRef == nil then
+				-- Bounded: a boot that fails in a loop must not grow this forever.
+				if #pendingToasts < 20 then
+					table.insert(pendingToasts, { text = text, kind = kind, duration = duration })
 				end
+				return
+			end
+			local ok, err = pcall(Toast.show, toastRef, text, kind, duration)
+			if not ok then
+				warn("[MKUltraHUB][ui] toast failed: " .. tostring(err))
 			end
 		end
 	end
@@ -19407,6 +21193,20 @@ function Main.start()
 			motion = motion,
 			timers = runtime.timers,
 			scheduler = runtime.scheduler,
+			--[[
+				BOSS OUTRANKS MOVEMENT: while a boss fight is running, both the
+				teleport loop and the muscle-king flight stand down so they cannot
+				cancel the boss approach (or each other) every half second.
+
+				Passed as a closure over `boss`, which is declared above and
+				assigned further down -- a captured VALUE would be nil here,
+				because Boss is installed after Teleport.
+			]]
+			isBossFight = function()
+				return boss ~= nil
+					and store:get("boss.auto") == true
+					and Boss.isAlive(boss)
+			end,
 		})
 		teleportRef = teleport
 
@@ -19602,12 +21402,32 @@ function Main.start()
 		notify = notify("train"),
 	})
 
-	-- The autosave is a timer, not a task: cancellable, counted, and it dies with
-	-- the runtime instead of outliving the script. The tracker makes it skip the
-	-- encode and the disk write when nothing persistable has changed, so an idle
-	-- session is not rewriting an identical file every 8 seconds.
+	--[[
+		THE AUTOSAVE IS A 1 Hz POLL, NOT A FIXED-RATE TIMER.
+
+		The requirement is "every 10 seconds by default, and once immediately when
+		the script is closed". A `timers:every(10, ...)` cannot honour a changed
+		interval without being torn down and re-registered, and it also cannot
+		express "10 s since the last ACTUAL write" -- which is what the user means,
+		since the tracker skips writes when nothing persistable changed.
+
+		A 1 Hz tick that compares `now - lastSave` against `cfg.saveSeconds` costs
+		nothing measurable (one number comparison) and makes the setting take
+		effect on the next second. The close-side save already lives in
+		`session.stop`, which is the "immediately when closing" half.
+	]]
 	local saveTracker = Persist.tracker(store)
-	runtime.timers:every(os.clock(), Main.AUTOSAVE_SECONDS, function()
+	local lastSave = os.clock()
+	runtime.timers:every(os.clock(), Main.SAVE_POLL_SECONDS, function()
+		local interval = tonumber(store:get("cfg.saveSeconds")) or 10
+		if interval < 3 then
+			interval = 3
+		end
+		local now = os.clock()
+		if now - lastSave < interval then
+			return
+		end
+		lastSave = now
 		local ok, err = Persist.save(store, saveTracker)
 		if not ok then
 			warn("[MKUltraHUB][config] save failed: " .. tostring(err))
@@ -19705,17 +21525,19 @@ function Main.start()
 		Shell.build(shell)
 
 		-- The info window shares the shell's screen, so the shell has to be able
-		-- to tell it when the main window collapses. The panel is built further
-		-- down (it needs the shell first), so the link is a callback that stays
-		-- nil until then and is skipped harmlessly before that.
+		-- to tell it when the main window changes shape. The panel is built
+		-- further down (it needs the shell first), so the link is a callback that
+		-- stays nil until then and is skipped harmlessly before that.
 		shell.onVisualState = function(state)
 			if infoWindow == nil then
 				return
 			end
-			-- Collapsed and pill both mean "the main window is not a window right
-			-- now", and the panel must not float over a bar that is 36px tall.
-			local hidden = state.mode == "minimized" or state.mode == "pill"
-			InfoWindow.setShellHidden(infoWindow, hidden)
+			-- The panel gets the MODE, not a pre-computed "hide me": whether a
+			-- collapsed main window hides it is a setting, and keeping the answer
+			-- in one place is what lets that setting change while the window is
+			-- already collapsed. Default is "do not hide" -- see
+			-- InfoWindow.applyVisibility.
+			InfoWindow.setShellMode(infoWindow, state.mode)
 		end
 
 		-- The reset button is the recovery path, so it has to repair the info
@@ -19763,6 +21585,27 @@ function Main.start()
 		shell.onToast = function(text, kind, duration)
 			Toast.show(toastRef, text, kind, duration)
 		end
+		-- The widget library reports its own actions (a toggle flipped, a slider
+		-- released, a number committed) through the same stack. Installed after
+		-- the stack exists, which is why Kit takes it as a callback.
+		kit.onToast = function(text, kind, duration)
+			Toast.show(toastRef, text, kind, duration)
+		end
+
+		-- Flush whatever the boot raised before there was anywhere to show it.
+		if #pendingToasts > 0 then
+			local buffered = pendingToasts
+			pendingToasts = {}
+			for index, entry in ipairs(buffered) do
+				-- Staggered slightly so twenty boot messages are readable rather
+				-- than a stack that retires itself before it can be read.
+				runtime.timers:after(os.clock(), (index - 1) * 0.12, function()
+					if toastRef ~= nil then
+						Toast.show(toastRef, entry.text, entry.kind, entry.duration)
+					end
+				end)
+			end
+		end
 
 		-- The info window shares the shell's screen, so both panels live in one
 		-- coordinate space and can be compared directly when placing.
@@ -19791,7 +21634,7 @@ function Main.start()
 		-- the panel once, now: the subscription that drives this fires on CHANGE,
 		-- and "started minimised" is a state, not a change.
 		local state = Shell.visualState(shell)
-		InfoWindow.setShellHidden(infoWindow, state.mode == "minimized" or state.mode == "pill")
+		InfoWindow.setShellMode(infoWindow, state.mode)
 
 		--[[
 			Reset per-character state when the character is REPLACED.
