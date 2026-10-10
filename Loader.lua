@@ -3,7 +3,7 @@
 --  MKUltraHUB -- GENERATED BUNDLE. DO NOT EDIT.
 --  Source of truth: src\**\*.luau   Builder: tools\bundle.ps1
 --  Modules: 68   Entry: main
---  Generated: 2026-10-10 14:54:02
+--  Generated: 2026-10-10 18:32:40
 -- ===========================================================================
 
 local __modules = {}
@@ -3388,12 +3388,66 @@ local GYM_LABELS: { [string]: string } = {
 	["未知"] = "未知",
 }
 
+--[[
+	Display names for machines.
+
+	The NAME LIST comes from a live scan of `Workspace.machinesFolder` (see
+	game/Machine.luau) and this build of the game names them per gym, e.g.
+	"Frost Squat", "Industrial Bench", "Legends Throw", "Overcharged Bar Lift",
+	"Muscle King Bench", "Jungle Boulder". A dump of the real game shows 40+
+	distinct names, and the original five-entry table left almost every one of
+	them rendering in English while the rest of the interface was Chinese.
+
+	Composed per (gym prefix, machine type) rather than listed one by one: the set
+	grows as new gyms are added, and a lookup that silently falls back to English
+	would go stale again on the next update.
+]]
 local MACHINE_LABELS: { [string]: string } = {
 	["Squat Rack"] = "深蹲架",
 	["Bench Press"] = "卧推台",
 	["Deadlift"] = "硬拉台",
 	["Pullups"] = "引体向上",
 	["Boulder Throw"] = "巨石投掷",
+	["Treadmill"] = "跑步机",
+	-- The durability "rocks" are named individually rather than per gym.
+	["Tiny Rock"] = "小岩石",
+	["Punching Rock"] = "拳击岩",
+	["Frozen Rock"] = "冰封岩",
+	["Inferno Rock"] = "炼狱岩",
+	["Rock Of Legends"] = "传奇之岩",
+	["Muscle King Mountain"] = "肌肉之王山",
+	["Ancient Jungle Rock"] = "远古丛林岩",
+	["Industrial Rock"] = "工业岩",
+	["Overcharged Rock"] = "超载岩",
+}
+
+-- The gym prefix each machine family is named after, and its Chinese form.
+type Prefix = { en: string, cn: string }
+type Suffix = { en: string, cn: string }
+
+local GYM_PREFIXES: { Prefix } = {
+	{ en = "Frost", cn = "冰霜" },
+	{ en = "Mythical", cn = "神话" },
+	{ en = "Eternal", cn = "永恒" },
+	{ en = "Legends", cn = "传奇" },
+	{ en = "Jungle", cn = "丛林" },
+	{ en = "Industrial", cn = "工业" },
+	{ en = "Overcharged", cn = "超载" },
+	{ en = "Muscle King", cn = "肌肉之王" },
+}
+
+-- The trailing machine word, longest first so "Bar Lift" wins over "Lift".
+local MACHINE_SUFFIXES: { Suffix } = {
+	{ en = "Bar Lift", cn = "硬拉" },
+	{ en = "Boulder", cn = "巨石" },
+	{ en = "Bench", cn = "卧推" },
+	{ en = "Squat", cn = "深蹲" },
+	{ en = "Press", cn = "卧推" },
+	{ en = "Pullup", cn = "引体向上" },
+	{ en = "Lift", cn = "硬拉" },
+	{ en = "Throw", cn = "投掷" },
+	{ en = "Treadmill", cn = "跑步机" },
+	{ en = "Rock", cn = "岩石" },
 }
 
 MachinePlan.UNKNOWN_GYM = "未知"
@@ -3428,11 +3482,35 @@ function MachinePlan.gymLabel(gym: string?): string
 	return GYM_LABELS[gym] or gym
 end
 
+--[[
+	A display name for a machine.
+
+	Exact names first (the five canonical ones), then "gym prefix + machine word"
+	for the per-gym families, and finally the raw name so an unknown machine is
+	shown rather than swallowed.
+]]
 function MachinePlan.machineLabel(name: string?): string
-	if name == nil then
+	if name == nil or name == "" then
 		return ""
 	end
-	return MACHINE_LABELS[name] or name
+	local exact = MACHINE_LABELS[name]
+	if exact ~= nil then
+		return exact
+	end
+
+	-- "Frost Squat" -> 冰霜深蹲, "Muscle King Bench" -> 肌肉之王卧推
+	for _, prefix in ipairs(GYM_PREFIXES) do
+		if string.sub(name, 1, #prefix.en) == prefix.en then
+			local rest = string.sub(name, #prefix.en + 2)
+			for _, suffix in ipairs(MACHINE_SUFFIXES) do
+				if rest == suffix.en then
+					return prefix.cn .. suffix.cn
+				end
+			end
+		end
+	end
+
+	return name
 end
 
 function MachinePlan.byGym(seats: { Seat }, gym: string?): { Seat }
@@ -6412,18 +6490,23 @@ function Motion.begin(self, options): boolean
 
 	if self.saved == nil then
 		--[[
-			Gravity is part of the snapshot too.
+			Snapshot the two properties release() restores.
 
-			The strict anti-pull mode sets `Humanoid.Gravity` to keep the character
-			pinned. `release` restored walk/jump but not gravity, so a freeze that
-			tweaked it left the player floating or glued to the floor after the
-			hold ended -- a state that outlives the feature that caused it.
-			V1007 snapshotted it with the other two.
+			There is deliberately NO gravity here. An earlier revision read and
+			wrote `humanoid.Gravity`, which DOES NOT EXIST -- gravity lives on
+			`Workspace`. That raised "Gravity is not a valid member of Humanoid" on
+			every hold (the user's log showed it flooding from both `task:boss` and
+			`timer`, 60+ folded copies every 30 seconds) and it also meant the
+			restore never happened, because the whole shared `pcall` aborted before
+			the walk/jump writes.
+
+			Nothing in this module changes gravity, so there is nothing to restore:
+			the strict anti-pull mode pins the character by anchoring the root and
+			zeroing its velocity, not by fiddling with gravity.
 		]]
 		self.saved = {
 			walk = humanoid.WalkSpeed,
 			jump = humanoid.JumpPower,
-			gravity = humanoid.Gravity,
 		}
 	end
 
@@ -6740,17 +6823,13 @@ function Motion.release(self)
 		pcall(function()
 			local walk = if saved ~= nil then saved.walk else nil
 			local jump = if saved ~= nil then saved.jump else nil
-			local gravity = if saved ~= nil then saved.gravity else nil
 			humanoid.PlatformStand = false
 			humanoid.Sit = false
 			humanoid.AutoRotate = true
 			humanoid.WalkSpeed = (walk ~= nil and walk > 0) and walk or 16
 			humanoid.JumpPower = (jump ~= nil and jump > 0) and jump or 50
-			-- Only restored when it was actually captured: writing a default here
-			-- would silently change a game that ships a non-standard gravity.
-			if gravity ~= nil then
-				humanoid.Gravity = gravity
-			end
+			-- No gravity write: `Humanoid.Gravity` does not exist. Gravity lives
+			-- on `Workspace`, and this module never changes it.
 			humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
 		end)
 	end
@@ -8934,6 +9013,11 @@ function Boss.new(context)
 		-- The pet preset follows the task: "boss" while the fight runs, back to
 		-- "train" when it ends -- the same revert V1007's boss task onDisable did.
 		pets = context.pets or nil,
+		-- Used on exit to restore the body size. A FUNCTION, not the service:
+		-- main.luau installs Size AFTER Boss, so a captured value would be nil --
+		-- the same ordering trap the pet service above avoids by being installed
+		-- first.
+		sizeRef = context.size or nil,
 		-- Where to put the player back when the boss task turns off.
 		lastPosition = nil,
 		cacheAt = 0,
@@ -9027,27 +9111,73 @@ function Boss.info(self)
 	return Boss.detect(self)
 end
 
-function Boss.tick(self, now)
-	local info = Boss.detect(self)
-	if info.alive and typeof(info.position) == "Vector3" then
-		-- Remembered BEFORE the hover, so a boss that dies mid-fight leaves the
-		-- player near where they came in rather than stranded 70 studs up.
-		local root = self.character:requireRoot()
-		if root ~= nil then
-			local ok, position = pcall(function()
-				return root.Position
-			end)
-			if ok and typeof(position) == "Vector3" then
-				self.lastPosition = position
-			end
+--[[
+	Get onto the boss, properly.
+
+	The old shape of this was ONLY a motion hold: `motion:setTarget(pos)` plus
+	`motion:begin`, and then `Motion.apply` rewrites the character's CFrame every
+	frame to keep it there. Two things made that not work in practice:
+
+	  * the hold re-writes the SAME position every frame, so the character is
+	    pinned where it started rather than carried to the boss -- with the boss
+	    spawning far away, "it only tries to attack and never gets there" is the
+	    exact symptom;
+	  * if a hold was already active for another reason (a teleport, a combat
+	    approach), `motion:begin` was never called at all, so the boss task did
+	    nothing but observe.
+
+	This drives the teleport directly and keeps the hold only as the anti-pull
+	correction once we are actually near. The re-approach is rate limited: a boss
+	that is alive but unreachable must not be re-teleported to every frame.
+]]
+local APPROACH_INTERVAL = 0.5
+local ARRIVE_DISTANCE = 12
+-- Hover height above the boss: close enough for the punches to land, high enough
+-- that the boss's own attacks mostly miss. V1007 hard-coded 70.
+local BOSS_HOVER_HEIGHT = 70
+
+function Boss.approach(self, now)
+	local info = self.detect(self)
+	if not info.alive or typeof(info.position) ~= "Vector3" then
+		self.approachAt = 0
+		return
+	end
+
+	local root = self.character:requireRoot()
+	if root == nil then
+		return
+	end
+	local ok, position = pcall(function()
+		return root.Position
+	end)
+	if not ok or typeof(position) ~= "Vector3" then
+		return
+	end
+
+	-- Remembered BEFORE we move, so a boss that dies mid-fight leaves the player
+	-- near where they came in rather than stranded above an empty arena.
+	self.lastPosition = position
+
+	-- Hover height: close enough for the punches to land, high enough that the
+	-- boss's own attacks mostly miss.
+	local destination = info.position + Vector3.new(0, BOSS_HOVER_HEIGHT, 0)
+	local distance = (position - destination).Magnitude
+
+	if distance > ARRIVE_DISTANCE and self.teleport ~= nil then
+		if now - (self.approachAt or 0) >= APPROACH_INTERVAL then
+			self.approachAt = now
+			-- hold = false while travelling: the walk owns the character for the
+			-- duration, and the hold begins on arrival (see Teleport._arrive).
+			self.teleport:walk(destination, { mode = "boss", hold = false, arc = 120 })
 		end
-		-- Hover above the boss: close enough for the punches to land, high enough
-		-- that its own attacks mostly miss.
-		local destination = info.position + Vector3.new(0, 70, 0)
-		self.motion:setTarget(destination)
-		if not self.motion:isActive() then
-			self.motion:begin({ pos = destination, mode = "boss" })
-		end
+		return
+	end
+
+	-- In range: keep the position with the motion hold so a server pull-back is
+	-- corrected rather than leaving the player on the ground.
+	self.motion:setTarget(destination)
+	if not self.motion:isActive() then
+		self.motion:begin({ pos = destination, mode = "boss" })
 	end
 end
 
@@ -9063,6 +9193,36 @@ end
 function Boss.leave(self)
 	if self.pets ~= nil then
 		Pets.scheduleSwap(self.pets, "train", 0.5)
+	end
+
+	--[[
+		Put the body back.
+
+		V1007's boss-task `onDisable` ended with:
+
+		    if not Core.size.selfEnabled then
+		        Core._lastWantSize = 1
+		        Core.changeSelfSize(1)
+		    end
+
+		i.e. it restored the size EXPLICITLY rather than waiting for the size task
+		to notice. That matters because `SizePolicy.wanted` gates the boss branch on
+		`bossAlive AND boss.sizeEnabled`, so turning auto-boss OFF while the boss is
+		still alive does not change what the policy wants -- the player stays
+		enlarged for as long as the boss lives, which is what the user saw as "关闭
+		打 Boss 后不会切换回原来的体型".
+
+		Only when the user has no size setting of their own: if they do, `Size.tick`
+		owns the value and the policy already wants THEIR size, so forcing 1 here
+		would fight it.
+	]]
+	local size = self.sizeRef
+	if type(size) == "function" then
+		size = size()
+	end
+	if size ~= nil and self.store:get("size.selfEnabled") ~= true then
+		size.last = nil
+		size:apply(1)
 	end
 
 	local destination = nil
@@ -9187,7 +9347,7 @@ function Boss.install(context)
 			Boss.leave(self)
 		end,
 		tick = function(_dt, now)
-			Boss.tick(self, now)
+			Boss.approach(self, now)
 		end,
 	})
 
@@ -10764,7 +10924,27 @@ function Rejoin.errorMessage()
 		return nil
 	end
 	local overlay = prompt:FindFirstChild("promptOverlay")
-	if overlay == nil or overlay.Enabled ~= true then
+	if overlay == nil then
+		return nil
+	end
+
+	--[[
+		`promptOverlay` is a Frame, and a Frame has no `Enabled` property.
+
+		The original check read `overlay.Enabled ~= true`, which raised
+		"Enabled is not a valid member of Frame" on EVERY tick -- the rejoin
+		emergency task runs constantly, so this flooded the log (the user saw
+		"另有 59 条同类错误被折叠" every 30 seconds) and meant the emergency path
+		never actually detected a disconnect.
+
+		`Visible` is the property a Frame has, and it is also the one that means
+		"the prompt is on screen". The read is guarded so a future Roblox change
+		to this container cannot flood the log again.
+	]]
+	local okVisible, visible = pcall(function()
+		return overlay.Visible
+	end)
+	if not okVisible or visible ~= true then
 		return nil
 	end
 	local title = overlay:FindFirstChild("ErrorTitle")
@@ -14852,6 +15032,11 @@ function Shell.confirm(self, title, text, onConfirm, onCancel)
 		ZIndex = 900,
 		BorderSizePixel = 0,
 		AutoButtonColor = false,
+		-- Same reasoning as Shell.preview: a live full-screen button reports
+		-- `gameProcessedEvent`, so while a dialog is up it swallows every drag and
+		-- click meant for the window underneath. The dialog's own buttons and the
+		-- card handle dismissal; this layer is only the dim.
+		Active = false,
 	}, self.screen)
 	local card = kit:instance("Frame", {
 		AnchorPoint = Vector2.new(0.5, 0.5),
@@ -14998,6 +15183,19 @@ function Shell.preview(self, title, lines, lifetime, anchor)
 		ZIndex = 910,
 		BorderSizePixel = 0,
 		AutoButtonColor = false,
+		--[[
+			The full-screen dismiss layer must NOT be a live button.
+
+			It was one, and that is why "点了问号之后整个窗口拖不动" happened: a
+			Button reports `gameProcessedEvent = true`, so while the preview was up
+			every drag of the main window was swallowed by this transparent layer
+			instead of reaching the title bar underneath. The window looked frozen
+			for as long as the card was shown.
+
+			With `Active = false` it is pure decoration: the card itself still
+			closes on click, and the rest of the interface keeps working.
+		]]
+		Active = false,
 	}, self.screen)
 
 	--[[
@@ -15663,6 +15861,20 @@ function InfoWindow.build(self)
 		Visible = false,
 		ZIndex = 600,
 		Active = true,
+		--[[
+			Required, or minimising does nothing visible.
+
+			Collapsing tweens the frame's HEIGHT to `MINIMIZED_HEIGHT` (36). Every
+			child below that line -- the 服务器 line at y=40, Place ID at y=56, the
+			查看：自己 button at y=78, the scrolling read-out -- is still a child of
+			this frame and still rendered, because a Frame does NOT clip its
+			descendants by default. That is why the user saw "最小化之后服务器信息、
+			Place ID、查看自己还在": the window got shorter and everything below it
+			just hung outside the new bounds.
+
+			V1007 set this on the equivalent frame.
+		]]
+		ClipsDescendants = true,
 	}, screen)
 	kit:corner(frame, 10)
 	kit:stroke(frame, kit:color("Border"), 1.2, 0)
@@ -16089,25 +16301,78 @@ end
 	`visible`, so a rapid off/on does not get hidden by an exit that is no longer
 	current.
 ]]
+--[[
+	Where the panel collapses INTO: the main window's centre.
+
+	The panel shares the ScreenGui with the main window, so "fuse back into the
+	main panel" is a real motion here rather than a fade. V1007 did exactly this
+	(its close handler animated the frame into the main window); the refactor
+	reduced it to an instant visibility flip, which is why the user saw the close
+	as "只是缩小了一点" with no merge.
+]]
+function InfoWindow.mergeTarget(self)
+	local main = self.shell ~= nil and self.shell.main or nil
+	if main == nil then
+		return nil
+	end
+	local ok, position = pcall(function()
+		return main.AbsolutePosition
+	end)
+	local okSize, size = pcall(function()
+		return main.AbsoluteSize
+	end)
+	if not ok or not okSize then
+		return nil
+	end
+	-- Absolute screen coords. The frame's own Position is 0,0 and its parent is
+	-- the ScreenGui, so screen coords and frame coords coincide.
+	return Vector2.new(position.X + size.X / 2, position.Y + size.Y / 2)
+end
+
+--[[
+	Entrance / exit motion for the panel.
+
+	Show: grows OUT of the main window's centre with a Back (overshoot) ease.
+	Hide: shrinks back INTO that same point, so closing reads as fusing back in.
+
+	The transform is `Size` + `Position` (with the UIScale left alone, because
+	`place()` owns its factor). The geometry is handed back to `place()` when the
+	motion finishes, so this is purely an effect and the panel always ends up
+	exactly where the normal layout code puts it.
+]]
 function InfoWindow.animateIn(self)
 	if self.frame == nil or self.scale == nil then
 		return
 	end
-	self.animating = true
-	self.scale.Scale = 0.94
+	local merge = InfoWindow.mergeTarget(self)
+	local height = if self.minimized then MINIMIZED_HEIGHT else self.baseHeight
+
+	if merge == nil then
+		-- Nothing to grow out of: a plain pop, no geometry games.
+		self.scale.Scale = 0.94
+		self.kit:tween(self.scale, 0.26, { Scale = 1 }, Enum.EasingStyle.Back)
+		return
+	end
+
+	local centreX = merge.X
+	local centreY = merge.Y
+	self.frame.AnchorPoint = Vector2.new(0.5, 0.5)
+	self.frame.Position = UDim2.fromOffset(centreX, centreY)
+	self.frame.Size = UDim2.fromOffset(self.baseWidth * 0.2, height * 0.2)
 	self.frame.BackgroundTransparency = 1
-	if self.bar ~= nil then
-		self.bar.BackgroundTransparency = 1
-	end
-	self.kit:tween(self.scale, 0.2, { Scale = 1 }, Enum.EasingStyle.Quint)
-	self.kit:tween(self.frame, 0.2, { BackgroundTransparency = 0 })
-	if self.bar ~= nil then
-		self.kit:tween(self.bar, 0.2, { BackgroundTransparency = 0 })
-	end
-	self:delay(0.22, function()
-		self.animating = false
-		-- `place()` writes the real factor; while animating, the entrance value
-		-- above is what is on screen.
+
+	self.kit:tween(self.frame, 0.3, {
+		Position = UDim2.fromOffset(centreX - self.baseWidth / 2, centreY - height / 2),
+		Size = UDim2.fromOffset(self.baseWidth, height),
+		BackgroundTransparency = 0,
+	}, Enum.EasingStyle.Back)
+	self.kit:delay(0.32, function()
+		if self.frame == nil then
+			return
+		end
+		-- Hand geometry back to the layout owner.
+		self.frame.AnchorPoint = Vector2.new(0, 0)
+		InfoWindow.applyBaseSize(self)
 		InfoWindow.place(self)
 	end)
 end
@@ -16119,11 +16384,35 @@ function InfoWindow.animateOut(self)
 		InfoWindow.applyVisibility(self)
 		return
 	end
-	self.animating = true
-	self.kit:tween(self.scale, 0.16, { Scale = 0.94 }, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
-	self:delay(0.17, function()
-		self.animating = false
+	local merge = InfoWindow.mergeTarget(self)
+	if merge == nil then
 		InfoWindow.applyVisibility(self)
+		return
+	end
+
+	local height = if self.minimized then MINIMIZED_HEIGHT else self.baseHeight
+	-- Anchor at the centre so the shrink converges on the merge point instead of
+	-- collapsing toward its own top-left corner.
+	self.frame.AnchorPoint = Vector2.new(0.5, 0.5)
+	local fromX = self.frame.AbsolutePosition.X + self.frame.AbsoluteSize.X / 2
+	local fromY = self.frame.AbsolutePosition.Y + self.frame.AbsoluteSize.Y / 2
+	self.frame.Position = UDim2.fromOffset(fromX, fromY)
+
+	self.kit:tween(self.frame, 0.22, {
+		Position = UDim2.fromOffset(merge.X, merge.Y),
+		Size = UDim2.fromOffset(self.baseWidth * 0.2, height * 0.2),
+		BackgroundTransparency = 1,
+	}, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+	self.kit:delay(0.24, function()
+		if self.frame == nil then
+			return
+		end
+		self.frame.AnchorPoint = Vector2.new(0, 0)
+		InfoWindow.applyVisibility(self)
+		-- Restore the real geometry for the next show, which animates from
+		-- scratch -- leaving the 20%-size here would make the reopen jump.
+		InfoWindow.applyBaseSize(self)
+		InfoWindow.place(self)
 	end)
 end
 
@@ -18515,28 +18804,45 @@ Page.build = function(kit, page, shell)
 		end))
 	end
 
-	-- The selected marker follows the store, so it is correct on load and after a
-	-- change made anywhere else. The initial paint snaps: animating it would make
-	-- the page visibly "select" its theme as it opens.
-	kit:bind("uiState.theme", "light", function(active, initial)
+	--[[
+		The selected marker follows the store, so it is correct on load and after
+		a change made anywhere else. The initial paint snaps: animating it would
+		make the page visibly "select" its theme as it opens.
+
+		EVERY button is re-rendered on every change, from one function. The
+		previous version drove the same state from the binding AND left
+		`Kit.animate`'s hover tween free to overwrite `BackgroundColor3`; a button
+		the pointer had already visited kept whatever colour the hover path last
+		wrote, so the page showed several "selected" buttons at once until
+		something forced a full repaint. Re-asserting the resting colour here (and
+		refreshing the attribute `Kit.animate` reads on mouse-leave) is what makes
+		the marker exactly one button, always.
+	]]
+	local function render(active, initial)
 		for _, choice in ipairs(CHOICES) do
 			local button = buttons[choice.key]
-			local selected = choice.key == active
-			local base = if selected then kit:color("Green") else kit:color("White")
-			local textColor = if selected then kit:color("White") else kit:color("TextPrimary")
-			button:SetAttribute(Attributes.BASE_COLOR, base)
-			if initial == true then
-				button.BackgroundColor3 = base
-				button.TextColor3 = textColor
-			else
-				kit:tween(button, 0.2, {
-					BackgroundColor3 = base,
-					TextColor3 = textColor,
-				})
+			if button ~= nil then
+				local selected = choice.key == active
+				local base = if selected then kit:color("Green") else kit:color("White")
+				local textColor = if selected then kit:color("White") else kit:color("TextPrimary")
+				-- Keep the hover path's resting colour in step, or the next
+				-- mouse-leave puts this button back to the OLD theme's colour.
+				button:SetAttribute(Attributes.BASE_COLOR, base)
+				button.Text = choice.label .. (if selected then "  ✓" else "")
+				if initial == true then
+					button.BackgroundColor3 = base
+					button.TextColor3 = textColor
+				else
+					kit:tween(button, 0.2, {
+						BackgroundColor3 = base,
+						TextColor3 = textColor,
+					})
+				end
 			end
-			button.Text = choice.label .. (if selected then "  ✓" else "")
 		end
-	end)
+	end
+
+	kit:bind("uiState.theme", "light", render)
 
 	kit:section(page, "预览")
 	local preview = kit:card(page)
@@ -19195,6 +19501,12 @@ function Main.start()
 			teleport = teleport,
 			timers = runtime.timers,
 			pets = pets,
+			-- A late-bound getter: Size is installed AFTER Boss, so capturing the
+			-- service here would capture nil. The closure reads the upvalue at
+			-- call time, which is only ever during Boss.leave.
+			size = function()
+				return size
+			end,
 			notify = notify("boss"),
 		})
 
