@@ -2,8 +2,8 @@
 -- ===========================================================================
 --  MKUltraHUB -- GENERATED BUNDLE. DO NOT EDIT.
 --  Source of truth: src\**\*.luau   Builder: tools\bundle.ps1
---  Modules: 70   Entry: main
---  Generated: 2026-10-11 12:12:03
+--  Modules: 71   Entry: main
+--  Generated: 2026-10-11 13:10:15
 -- ===========================================================================
 
 local __modules = {}
@@ -1362,9 +1362,36 @@ local SCHEMA: { Spec } = {
 		The NAME is what the user types; the job id is resolved at rejoin time
 		(users.roblox.com -> presence.roblox.com), so a renamed or offline player
 		simply falls through to the next rung of the fallback chain instead of
-		being an error.
+		being an error. The 跟随玩家 feature below reads the SAME name: one piece
+		of state, one place to type it.
 	]]
 	str("rejoin.targetPlayer", ""),
+
+	--[[
+		跟随玩家 ("stay on the same server as this player").
+
+		This is a FEATURE, not a rejoin mode: with it on, the script watches the
+		named player and acts on its own -- there is nothing for the user to
+		trigger, which is precisely what the "重进目标 = 目标玩家所在服务器"
+		dropdown could not do (it only chose where an ALREADY triggered rejoin
+		would land, and nothing ever triggered one because the player left).
+
+		The rules live in core/Follow (pure, tested); these keys are its numbers:
+
+		    poll         how often "is he in this game yet" is asked while away
+		    gap          the floor between two join attempts (a full server fails
+		                 silently, and the verdict takes ~20 s)
+		    waitSeconds  give up after this long without finding him in game
+		    maxAttempts  give up after this many failed joins in one session
+
+		Default OFF, like every other switch that moves the character: `enabled`
+		alone performs nothing, but it is what allows a teleport, so it is opt-in.
+	]]
+	bool("follow.enabled", false),
+	num("follow.poll", 10, 2, 300),
+	num("follow.gap", 30, 5, 600),
+	num("follow.waitSeconds", 600, 30, 7200),
+	num("follow.maxAttempts", 4, 1, 20),
 
 	--[[
 		Metadata that travels INSIDE a config file rather than describing a
@@ -4892,9 +4919,18 @@ __modules["core/ServerPick"] = function()
 	    crowded  -- most players first, this server last
 	    sparse   -- fewest players first, this server last
 	    private  -- a private server code, falling back to this server
+	    player   -- one named player's server, then the gradient fallback
+	    follow   -- the target player's server and NOTHING else (see below)
 
 	Every mode ends with a fallback rather than a dead end, because the failure
 	mode of "cannot rejoin" is staying in a session the user asked to leave.
+
+	`follow` is the ONE exception, and deliberately so: "跟随玩家" means "be on
+	the same server as this player", so a rung that lands anywhere else is not a
+	weaker version of success -- it is a failure that also costs the session. The
+	caller (game/Rejoin) therefore only asks for this chain once it has a
+	resolved job id that is not the server it is already on, and the chain holds
+	that single destination.
 
 	The private-server code extraction is real string parsing (a link, a query
 	parameter, or a bare code) and was inline in three chained `:match` calls
@@ -4915,7 +4951,7 @@ export type Plan = {
 	ids: { string },
 }
 
-ServerPick.MODES = { "same", "crowded", "sparse", "private" }
+ServerPick.MODES = { "same", "crowded", "sparse", "private", "player", "follow" }
 
 --[[
 	Pull the usable servers out of the games API response.
@@ -5126,6 +5162,18 @@ function ServerPick.chain(
 		for _, server in ipairs(sortByPlayers(servers, false)) do
 			addJob(server.id, "人少的服务器")
 		end
+	elseif resolved == "follow" then
+		--[[
+			THE TARGET'S SERVER, AND NOTHING ELSE.
+
+			No private-code rung and no public-server rung: those are exactly the
+			rungs that turn "跟随失败" into "被丢到一个陌生服务器" -- the user's
+			complaint was that following does not work, and a rejoin that lands on
+			a random server is indistinguishable from one that did nothing, except
+			that it also cost the session. A follow that cannot reach the player's
+			server must WAIT and try again (core/Follow owns that decision).
+		]]
+		addJob(targetJobId, "跟随目标玩家")
 	elseif resolved == "private" then
 		addPrivate("私服")
 		for _, server in ipairs(sortByPlayers(servers, false)) do
@@ -5146,7 +5194,13 @@ function ServerPick.chain(
 		end
 	end
 
-	-- The last rung always exists: staying/returning here beats "cannot rejoin".
+	--[[
+		The last rung always exists: staying/returning here beats "cannot rejoin".
+
+		For `follow` it is inert on purpose -- `Rejoin.attemptNext` skips a rung
+		that names the server we are already on, so "this server" can never be a
+		destination for a follow; it is only what makes the chain total.
+	]]
 	if resolved ~= "same" then
 		addJob(currentJobId, "原服务器")
 	end
@@ -13354,22 +13408,398 @@ end
 return GameMetrics
 end
 
+__modules["core/Follow"] = function()
+-- (module directive --!strict; the bundle is --!nonstrict)
+--[[
+	Follow -- "跟随玩家": stay on the same server as one named player. Pure.
+
+	The rule is the user's own, verbatim:
+
+	    一旦检测到了目标玩家离开了服务器，他就会先尝试看看有这个玩家在不在本
+	    游戏中，如果不在的话就等待一会，如果发现一旦发现他在游戏且不在当前
+	    服务器，他就会立刻加入目标玩家服务器
+
+	That is three decisions, and each one is a trap when it is left implicit:
+
+	  1. "he left this server" is a TRANSITION, not a state -- which is why the
+	     wait clock starts on the first observation that he is absent, and why
+	     the whole budget (attempts, wait) is handed back the moment he is here
+	     again. A player who comes back must not inherit an old give-up.
+	  2. "is he in this game at all" -- `nil` from the lookup means offline / in
+	     another place / not answerable, and ALL THREE MUST WAIT. The tempting
+	     alternative -- fall through to "some other server", which is what the
+	     rejoin chain does for the manual modes -- is strictly worse: it costs
+	     the session and gets you no closer to the target. This module therefore
+	     never returns a destination that did not come from the lookup.
+	  3. "join him" -- once, then re-evaluate. The joins are bounded by `gap`
+	     (a full target server fails SILENTLY: the teleport call succeeds and
+	     nothing happens) and by `maxAttempts`, because an unbounded retry loop
+	     against a full server is a hop loop.
+
+	Everything here is arithmetic over a supplied clock and a supplied
+	observation: no Roblox, no HTTP, no `task`. That is what makes the wait /
+	rate-limit / give-up rules testable -- see tests/Follow.spec.luau.
+]]
+
+local Follow = {}
+Follow.__index = Follow
+
+--[[
+	The actions, as named constants rather than bare strings: the caller matches
+	on them in a chain, and a typo in a bare string is a silently dead branch.
+
+	    "idle"    nothing to follow (feature off, or no name configured)
+	    "watch"   the target is in this server; nothing to do
+	    "resolve" ask "where is he" (the caller owns the HTTP lookup)
+	    "wait"    keep waiting: not ready, busy, throttled, or he is not in game
+	    "join"    go to `jobId`, now
+	    "stop"    give up for this session (attempts or wait exhausted)
+]]
+Follow.IDLE = "idle"
+Follow.WATCH = "watch"
+Follow.RESOLVE = "resolve"
+Follow.WAIT = "wait"
+Follow.JOIN = "join"
+Follow.STOP = "stop"
+
+--[[
+	Defaults, and why each number is where it is.
+
+	    poll         10 s -- how often "is he in this game yet" is asked while he
+	                        is away. The presence endpoint is rate limited per
+	                        IP, and a player does not appear and disappear in
+	                        seconds, so this is the gentlest useful cadence.
+	    gap          30 s -- the floor between two JOIN attempts. A full target
+	                        server is the common failure and the check for it
+	                        takes HOP_TIMEOUT (20 s), so anything much below this
+	                        would fire the next attempt while the previous one is
+	                        still being judged.
+	    waitSeconds 600 s -- ten minutes of waiting before giving up. The user's
+	                        words are "等待一会"; long enough to cover "he will be
+	                        back after this round", short enough that a mistyped
+	                        name does not poll forever.
+	    maxAttempts    4 -- four different servers failing to take us is a
+	                        pattern, not bad luck.
+]]
+Follow.DEFAULT_POLL = 10
+Follow.DEFAULT_GAP = 30
+Follow.DEFAULT_WAIT = 600
+Follow.DEFAULT_ATTEMPTS = 4
+
+export type Options = {
+	poll: number?,
+	gap: number?,
+	waitSeconds: number?,
+	maxAttempts: number?,
+}
+
+export type Observation = {
+	enabled: boolean,
+	-- The configured username; nil or "" means nothing to follow.
+	target: string?,
+	-- `Players:FindFirstChild(target) ~= nil` -- is he in THIS server.
+	inThisServer: boolean,
+	-- Which server we are on right now.
+	currentJobId: string,
+	-- The boot grace has passed and a rejoin would be accepted.
+	ready: boolean,
+	-- Somebody else (a trigger, the timer, the manual button) is rejoining.
+	busy: boolean,
+	-- A lookup is in flight; do not ask for another one.
+	lookupInFlight: boolean,
+	now: number,
+}
+
+export type Decision = {
+	action: string,
+	-- Only ever set for "join", and only ever a value the lookup produced.
+	jobId: string?,
+	reason: string,
+}
+
+type Result = {
+	jobId: string?,
+	at: number,
+	status: string,
+}
+
+export type Follow = {
+	_poll: number,
+	_gap: number,
+	_wait: number,
+	_maxAttempts: number,
+	-- He has been seen in this server at least once during this follow.
+	_seen: boolean,
+	-- When he was first observed to be absent; nil while he is here.
+	_missingAt: number?,
+	_attempts: number,
+	-- When the last JOIN was dispatched (0 = never).
+	_joinedAt: number,
+	-- The last lookup answer, and when it arrived.
+	_result: Result?,
+	-- The last decision, for the UI read-out.
+	_last: Decision,
+	-- How many steps returned "resolve" (diagnostics).
+	_lookups: number,
+}
+
+local function clampNumber(value: number?, fallback: number, low: number, high: number): number
+	local resolved = value or fallback
+	if resolved ~= resolved then
+		resolved = fallback
+	end
+	if resolved < low then
+		return low
+	end
+	if resolved > high then
+		return high
+	end
+	return resolved
+end
+
+function Follow.new(options: Options?): Follow
+	local opts: Options = options or {}
+	--[[
+		`_last` is initialised rather than left nil so that `status()` is total:
+		the UI reads it before the first tick, and a nil there is a nil-index in a
+		read-out that runs every half second.
+	]]
+	local self = setmetatable({
+		_poll = clampNumber(opts.poll, Follow.DEFAULT_POLL, 1, 3600),
+		_gap = clampNumber(opts.gap, Follow.DEFAULT_GAP, 1, 3600),
+		_wait = clampNumber(opts.waitSeconds, Follow.DEFAULT_WAIT, 1, 86400),
+		_maxAttempts = math.floor(clampNumber(opts.maxAttempts, Follow.DEFAULT_ATTEMPTS, 1, 100)),
+		_seen = false,
+		_missingAt = nil,
+		_attempts = 0,
+		_joinedAt = 0,
+		_result = nil,
+		_last = { action = Follow.IDLE, jobId = nil, reason = "未启用" },
+		_lookups = 0,
+	}, Follow)
+	return (self :: any) :: Follow
+end
+
+-- Re-read the settings WITHOUT losing the state: the user can retune the
+-- cadence while a follow is in progress, and the wait clock / attempt budget
+-- belong to the follow, not to the numbers.
+function Follow.configure(self: Follow, options: Options?)
+	local opts: Options = options or {}
+	self._poll = clampNumber(opts.poll, self._poll, 1, 3600)
+	self._gap = clampNumber(opts.gap, self._gap, 1, 3600)
+	self._wait = clampNumber(opts.waitSeconds, self._wait, 1, 86400)
+	self._maxAttempts = math.floor(clampNumber(opts.maxAttempts, self._maxAttempts, 1, 100))
+end
+
+-- Forget everything. Switching the feature off (or unconfiguring the target)
+-- must not leave a half-armed follow behind: re-enabling it is a new follow.
+function Follow.reset(self: Follow)
+	self._seen = false
+	self._missingAt = nil
+	self._attempts = 0
+	self._joinedAt = 0
+	self._result = nil
+	self._last = { action = Follow.IDLE, jobId = nil, reason = "未启用" }
+end
+
+-- Record the answer to a lookup. `status` is the caller's word for WHY there is
+-- no job id ("offline", "other-place", "no-http", "unknown"), which is the
+-- difference between "wait for him" and "this executor cannot find anyone".
+function Follow.remember(self: Follow, jobId: string?, now: number, status: string?)
+	-- Typed locals rather than an in-place `if resolved == nil then` assignment:
+	-- the analyzer keeps the `string?` from `status` through the branch, and the
+	-- record field is `string`.
+	local fallback: string = if jobId ~= nil and jobId ~= "" then "in-game" else "unknown"
+	local resolved: string = status or fallback
+	self._result = { jobId = jobId, at = now, status = resolved }
+end
+
+local function missReason(status: string, target: string?): string
+	local who = tostring(target or "目标玩家")
+	if status == "no-http" then
+		return string.format("查不到 %s：当前执行器没有可用的 HTTP 接口", who)
+	end
+	if status == "other-place" then
+		return string.format("%s 在同一个游戏的其他地点，无法跟随", who)
+	end
+	if status == "offline" then
+		return string.format("%s 不在本游戏（离线），继续等待", who)
+	end
+	return string.format("查询 %s 失败（网络或接口变动），继续等待", who)
+end
+
+local function verdict(self: Follow, action: string, jobId: string?, reason: string): Decision
+	local decision: Decision = { action = action, jobId = jobId, reason = reason }
+	self._last = decision
+	return decision
+end
+
+--[[
+	One decision.
+
+	The ORDER of the guards is the specification, so it is worth stating: being
+	off is not the same as having no target, "not ready / busy" outranks the
+	attempt budget (a refused request must not consume one), the budget outranks
+	the lookup (no point asking where he is if we are done trying), and a FRESH
+	answer outranks "a lookup is in flight" -- if we already know where he is,
+	the answer in hand is what we act on.
+]]
+function Follow.step(self: Follow, obs: Observation): Decision
+	local now = obs.now
+	local target = obs.target
+
+	if obs.enabled ~= true or target == nil or target == "" then
+		Follow.reset(self)
+		return self._last
+	end
+
+	if obs.inThisServer then
+		--[[
+			He is here. Everything the follow had accumulated is dropped: the
+			wait clock, the attempt budget AND the lookup answer. The answer
+			matters most -- a stale "he is on server X" that survived a successful
+			follow would teleport us straight back out of the server we just
+			joined if the presence record had not caught up.
+		]]
+		self._seen = true
+		self._missingAt = nil
+		self._attempts = 0
+		self._joinedAt = 0
+		self._result = nil
+		return verdict(self, Follow.WATCH, nil, string.format("%s 在本服，无需跟随", tostring(target)))
+	end
+
+	--[[
+		Absent: start (or continue) the wait clock. `nil` means "he was here until
+		a moment ago" only if `_seen`; otherwise the feature was just switched on
+		while he was already elsewhere, which is the same question asked from the
+		other side and is handled identically.
+
+		The clock is read through a local with an explicit type: the analyzer does
+		not carry a nil check on a table FIELD into the arithmetic, so
+		`now - self._missingAt` stays "number - number?" even right after the
+		branch that proved otherwise.
+	]]
+	if self._missingAt == nil then
+		self._missingAt = now
+	end
+	local missingAt: number = self._missingAt or now
+	local waited = now - missingAt
+
+	if obs.ready ~= true then
+		return verdict(self, Follow.WAIT, nil, "启动保护中（15 秒内不重进）")
+	end
+	if obs.busy == true then
+		return verdict(self, Follow.WAIT, nil, "已有重进正在进行")
+	end
+	if self._attempts >= self._maxAttempts then
+		return verdict(self, Follow.STOP, nil,
+			string.format("已尝试 %d 次仍进不去 %s 的服务器（多半满员）", self._attempts, tostring(target)))
+	end
+	if waited > self._wait then
+		return verdict(self, Follow.STOP, nil,
+			string.format("等待 %s 上线超过 %d 秒，已停止跟随", tostring(target), math.floor(self._wait)))
+	end
+	if self._joinedAt > 0 and now - self._joinedAt < self._gap then
+		return verdict(self, Follow.WAIT, nil, "距离上次尝试不久，稍后重试")
+	end
+
+	local result = self._result
+	if result ~= nil and now - result.at < self._poll then
+		-- A fresh answer: act on it.
+		if result.jobId == nil or result.jobId == "" then
+			return verdict(self, Follow.WAIT, nil, missReason(result.status, target))
+		end
+		if result.jobId == obs.currentJobId then
+			--[[
+				Presence LAGS a join: right after landing in his server the record
+				can still name the server we just left -- or, when we are already
+				where he is, name this one. Dropping the answer forces a re-lookup
+				next tick instead of teleporting to the server we are standing on.
+			]]
+			self._result = nil
+			return verdict(self, Follow.WAIT, nil, "记录显示目标与本服相同，稍后重查")
+		end
+		self._attempts += 1
+		self._joinedAt = now
+		return verdict(self, Follow.JOIN, result.jobId,
+			string.format("检测到 %s 不在本服，立即跟随", tostring(target)))
+	end
+
+	if obs.lookupInFlight == true then
+		return verdict(self, Follow.WAIT, nil, "正在查询目标玩家所在服务器")
+	end
+
+	self._lookups += 1
+	return verdict(self, Follow.RESOLVE, nil, string.format("查询 %s 所在服务器", tostring(target)))
+end
+
+--[[
+	What the settings page prints.
+
+	`waited` is computed here rather than stored, because the read-out wants
+	"how long has this been going on" and the state machine only ever needs the
+	start of the interval.
+]]
+export type Status = {
+	action: string,
+	reason: string,
+	seen: boolean,
+	attempts: number,
+	maxAttempts: number,
+	waited: number,
+	waitLimit: number,
+	jobId: string?,
+	resultStatus: string?,
+	poll: number,
+	gap: number,
+}
+
+function Follow.status(self: Follow, now: number): Status
+	-- A local, because the analyzer does not narrow a table FIELD through a nil
+	-- check: `now - self._missingAt` is "number - number?" even inside the
+	-- branch that proved it is not nil.
+	local missingAt = self._missingAt
+	local waited = 0
+	if missingAt ~= nil then
+		waited = math.max(0, now - missingAt)
+	end
+	local result = self._result
+	return {
+		action = self._last.action,
+		reason = self._last.reason,
+		seen = self._seen,
+		attempts = self._attempts,
+		maxAttempts = self._maxAttempts,
+		waited = waited,
+		waitLimit = self._wait,
+		jobId = if result ~= nil then result.jobId else nil,
+		resultStatus = if result ~= nil then result.status else nil,
+		poll = self._poll,
+		gap = self._gap,
+	}
+end
+
+return Follow
+end
+
 __modules["game/Rejoin"] = function()
 	local require = __require
 -- (module directive --!nonstrict; the bundle is --!nonstrict)
 --[[
-	Rejoin -- leaving and coming back: on a timer, on a bad-client trigger, or on
-	an error prompt.
+	Rejoin -- leaving and coming back: on a timer, on a bad-client trigger, on an
+	error prompt, or because the player we are following moved.
 
 	The decision rules are pure and tested (core/RejoinTriggers for "is the client
-	in a bad enough state", core/ServerPick for "where do we go"). This file is
-	the HTTP call, the teleport call, and the three tasks that drive them.
+	in a bad enough state", core/ServerPick for "where do we go", core/Follow for
+	"跟随玩家"). This file is the HTTP call, the teleport call, and the tasks that
+	drive them.
 
 	One deliberate exception to "no ad-hoc coroutines": performing a rejoin makes
 	a BLOCKING http request, and blocking the frame for the duration of a network
 	round trip would freeze the game. It runs in a task.spawn for that reason
-	alone, and it ends in a teleport -- the session is over either way. This is
-	the only such spawn in the refactor.
+	alone, and it ends in a teleport -- the session is over either way. The player
+	lookup that core/Follow needs runs the same way and for the same reason.
 ]]
 
 local Players = game:GetService("Players")
@@ -13379,6 +13809,7 @@ local CoreGui = game:GetService("CoreGui")
 
 local RejoinTriggers = require("core/RejoinTriggers")
 local ServerPick = require("core/ServerPick")
+local Follow = require("core/Follow")
 
 local Rejoin = {}
 Rejoin.__index = Rejoin
@@ -13396,8 +13827,23 @@ local HTTP_COOLDOWN = 300
 	error prompt to appear) and short enough that the user does not sit waiting.
 ]]
 local HOP_TIMEOUT = 20
--- The username -> job id lookup is two API calls; a retry loop must not repeat it.
+--[[
+	The username -> job id lookup is two API calls, so a POSITIVE answer is worth
+	caching for a minute.
+
+	A NEGATIVE answer is not: "he is not in this game" is the single most
+	volatile thing this module asks about, and the whole point of 跟随玩家 is to
+	notice the moment that changes. Caching a miss for the full minute was one of
+	the reasons following felt dead -- the player could come back online and the
+	feature would keep reporting "offline" for another fifty seconds.
+]]
 local PLAYER_CACHE = 60
+local PLAYER_MISS_TTL = 5
+--[[
+	How often core/Follow is consulted. The user-visible cadence is the poll/gap
+	settings inside it; this is only the loop that feeds it.
+]]
+local FOLLOW_TICK = 1
 
 function Rejoin.new(context)
 	local self = setmetatable({
@@ -13429,16 +13875,37 @@ function Rejoin.new(context)
 		hopLabel = nil,
 		playerCache = nil,
 		attempts = 0,
+		--[[
+			跟随玩家. The rules are core/Follow (pure, tested); this holds the
+			instance, whether a lookup is in flight, and the last decision so the
+			settings page can print what it is doing.
+		]]
+		follow = Follow.new(),
+		followLookup = false,
+		followAt = 0,
+		followAction = nil,
 	}, Rejoin)
 	return self
 end
 
-local function httpRequest(url, method, body, contentType)
-	local executor = (type(syn) == "table" and syn.request)
+--[[
+	The executor's HTTP function, if it has one.
+
+	Probed in one place because TWO callers need the same answer: `httpRequest`
+	(which needs the function) and the player lookup (which needs to know whether
+	a POST was even possible, so it can say "this executor cannot look players up"
+	instead of reporting a nonexistent user as offline).
+]]
+local function httpExecutor()
+	return (type(syn) == "table" and syn.request)
 		or (type(http) == "table" and http.request)
 		or (type(fluxus) == "table" and fluxus.request)
 		or request
 		or http_request
+end
+
+local function httpRequest(url, method, body, contentType)
+	local executor = httpExecutor()
 	if type(executor) == "function" then
 		local ok, response = pcall(executor, {
 			Url = url,
@@ -13471,81 +13938,180 @@ local function httpGet(url)
 end
 
 --[[
-	WHICH SERVER IS A NAMED PLAYER IN?
+	Percent-encode a query parameter.
 
-	Two API calls, both POST, both in the same executor-agnostic wrapper the
-	server list already uses:
-
-	    users.roblox.com/v1/usernames/users   name   -> userId
-	    presence.roblox.com/v1/presence/users userId -> gameId (the JOB id)
-
-	Returns nil for every failure mode -- unknown name, private "offline" presence,
-	playing a different place, no HTTP -- because the caller's job is then to fall
-	through to the next rung of the chain (私服 -> 人少的服务器), not to raise.
+	Roblox usernames are [%w_] so this is mostly a formality -- but the GET
+	fallback below puts the name in a URL, and an unencoded name is not an error,
+	it is a request for a DIFFERENT user.
 ]]
-function Rejoin.playerJobId(self, name)
-	if name == nil or name == "" then
+local function urlEncode(text: string): string
+	return (string.gsub(text, "[^%w%-%._~]", function(character)
+		return string.format("%%%02X", string.byte(character))
+	end))
+end
+
+local function decodeJson(text)
+	local ok, payload = pcall(function()
+		return HttpService:JSONDecode(text)
+	end)
+	if not ok or type(payload) ~= "table" then
 		return nil
 	end
-	local now = os.clock()
-	local cached = self.playerCache
-	if cached ~= nil and cached.name == name and now - cached.at < PLAYER_CACHE then
-		return cached.jobId
-	end
+	return payload :: any
+end
 
-	local function remember(jobId)
-		self.playerCache = { name = name, jobId = jobId, at = now }
-		return jobId
+-- The id out of `users.roblox.com/v1/usernames/users` (POST).
+local function idFromResolve(text)
+	local payload = decodeJson(text)
+	if payload == nil or type(payload.data) ~= "table" then
+		return nil
 	end
-
-	local resolveBody = HttpService:JSONEncode({ usernames = { name }, excludeBannedUsers = false })
-	local resolvedText = httpRequest("https://users.roblox.com/v1/usernames/users", "POST", resolveBody)
-	if resolvedText == nil then
-		return remember(nil)
-	end
-	local okResolve, resolved = pcall(function()
-		return HttpService:JSONDecode(resolvedText)
-	end)
-	local resolvePayload = resolved :: any
-	if not okResolve or type(resolvePayload) ~= "table" or type(resolvePayload.data) ~= "table" then
-		return remember(nil)
-	end
-	local userId = nil
-	for _, entry in ipairs(resolvePayload.data) do
+	for _, entry in ipairs(payload.data) do
 		if type(entry) == "table" and entry.id ~= nil then
-			userId = entry.id
-			break
+			return entry.id
 		end
 	end
-	if userId == nil then
-		return remember(nil)
-	end
+	return nil
+end
 
-	local presenceBody = HttpService:JSONEncode({ userIds = { userId } })
-	local presenceText = httpRequest("https://presence.roblox.com/v1/presence/users", "POST", presenceBody)
-	if presenceText == nil then
-		return remember(nil)
+--[[
+	The id out of `users.roblox.com/v1/users/search` (GET).
+
+	The name is matched EXACTLY rather than taking the first row: the endpoint is
+	a fuzzy search, so "Notch" would otherwise resolve to whoever Roblox ranks
+	first that contains those letters -- and following the wrong player is worse
+	than failing to follow one.
+]]
+local function idFromSearch(text, name)
+	local payload = decodeJson(text)
+	if payload == nil or type(payload.data) ~= "table" then
+		return nil
 	end
-	local okPresence, presence = pcall(function()
-		return HttpService:JSONDecode(presenceText)
-	end)
-	local presencePayload = presence :: any
-	if not okPresence or type(presencePayload) ~= "table" or type(presencePayload.userPresences) ~= "table" then
-		return remember(nil)
-	end
-	for _, entry in ipairs(presencePayload.userPresences) do
-		if type(entry) == "table" then
-			local placeId = tonumber(entry.placeId)
-			local gameId = entry.gameId
-			-- Same place and actually in a game: `gameId` IS the job id Roblox
-			-- accepts for TeleportToPlaceInstance. A different place is not a
-			-- rejoin target at all (we can only teleport inside this PlaceId).
-			if type(gameId) == "string" and gameId ~= "" and (placeId == nil or placeId == game.PlaceId) then
-				return remember(gameId)
+	local wanted = string.lower(name)
+	for _, entry in ipairs(payload.data) do
+		if type(entry) == "table" and entry.id ~= nil and type(entry.name) == "string" then
+			if string.lower(entry.name) == wanted then
+				return entry.id
 			end
 		end
 	end
-	return remember(nil)
+	return nil
+end
+
+--[[
+	The job id out of `presence.roblox.com/v1/presence/users` (POST), plus WHY
+	there is none -- two different answers for the user:
+
+	    "in-game"     -- here is the server id
+	    "offline"     -- not in a game right now (wait for him)
+	    "other-place" -- in this game but a different PlaceId, which cannot be
+	                     joined with TeleportToPlaceInstance at all
+	    "unknown"     -- the answer was not a presence payload
+
+	`gameId` IS the job id Roblox accepts. Its own `placeId` decides whether we
+	could join it: a teleport only works inside this PlaceId.
+]]
+local function jobFromPresence(text)
+	local payload = decodeJson(text)
+	if payload == nil or type(payload.userPresences) ~= "table" then
+		return nil, "unknown"
+	end
+	for _, entry in ipairs(payload.userPresences) do
+		if type(entry) == "table" then
+			local gameId = entry.gameId
+			local placeId = tonumber(entry.placeId)
+			if type(gameId) == "string" and gameId ~= "" then
+				if placeId ~= nil and placeId ~= game.PlaceId then
+					return nil, "other-place"
+				end
+				return gameId, "in-game"
+			end
+		end
+	end
+	return nil, "offline"
+end
+
+--[[
+	NAME -> the server he is in, or nil + why.
+
+	Two API calls, in the same executor-agnostic wrapper the server list already
+	uses. The username lookup is a POST first (the documented endpoint) with a GET
+	SEARCH as the fallback, because an executor that only implements `game:HttpGet`
+	is a real configuration -- and in that case the old code returned nil, which
+	the caller then reported as "the player is not there" and fell through to a
+	random server.
+]]
+local function lookupPlayerJob(name)
+	local userId = nil
+	local resolveText = httpRequest(
+		"https://users.roblox.com/v1/usernames/users",
+		"POST",
+		HttpService:JSONEncode({ usernames = { name }, excludeBannedUsers = false })
+	)
+	if type(resolveText) == "string" and resolveText ~= "" then
+		userId = idFromResolve(resolveText)
+	end
+	if userId == nil then
+		local searchText = httpGet(
+			"https://users.roblox.com/v1/users/search?keyword=" .. urlEncode(name) .. "&limit=10"
+		)
+		if type(searchText) == "string" and searchText ~= "" then
+			userId = idFromSearch(searchText, name)
+		end
+	end
+	if userId == nil then
+		if type(httpExecutor()) ~= "function" then
+			return nil, "no-http"
+		end
+		return nil, "unknown"
+	end
+
+	local presenceText = httpRequest(
+		"https://presence.roblox.com/v1/presence/users",
+		"POST",
+		HttpService:JSONEncode({ userIds = { userId } })
+	)
+	if type(presenceText) ~= "string" or presenceText == "" then
+		return nil, "no-http"
+	end
+	return jobFromPresence(presenceText)
+end
+
+--[[
+	WHICH SERVER IS A NAMED PLAYER IN?
+
+	Returns `(jobId, status)`. The status is what lets the caller distinguish
+	"he is offline, keep waiting" from "this executor cannot look anyone up",
+	which the old single-value version could not: it reported both as "not found",
+	and the manual `player` mode then silently downgraded to the next rung of the
+	fallback chain.
+
+	`force` skips the cache. The follow feature always forces -- a cached answer
+	is exactly what "he moved servers a second ago" defeats.
+]]
+function Rejoin.playerJobId(self, name, force)
+	if name == nil or name == "" then
+		return nil, "no-name"
+	end
+	local cached = self.playerCache
+	if force ~= true and cached ~= nil and cached.name == name then
+		--[[
+			A HIT IS GOOD FOR A MINUTE, A MISS FOR A MOMENT.
+
+			"Not in this game" is the most volatile answer this module asks for,
+			and caching it for the full minute was part of why following felt
+			dead: the player could come back and the feature would keep saying
+			"offline" for another fifty seconds.
+		]]
+		local ttl = if cached.jobId ~= nil and cached.jobId ~= "" then PLAYER_CACHE else PLAYER_MISS_TTL
+		if os.clock() - cached.at < ttl then
+			return cached.jobId, cached.status
+		end
+	end
+
+	local jobId, status = lookupPlayerJob(name)
+	self.playerCache = { name = name, jobId = jobId, at = os.clock(), status = status }
+	return jobId, status
 end
 
 --[[
@@ -13601,22 +14167,41 @@ end
 	`modeOverride` lets a caller name its own target for THIS request -- the
 	event-boss hop does, because "back to this server" is never a useful answer to
 	"the bosses here are all dead".
+
+	`exactJobId` is the follow feature's resolved destination. It is passed in
+	rather than looked up again here because the lookup is a pair of HTTP calls
+	that BLOCK: doing it a second time inside the rejoin would both delay the
+	teleport and risk a different answer than the one the decision was made on.
 ]]
-function Rejoin.perform(self, reason, modeOverride)
+function Rejoin.perform(self, reason, modeOverride, exactJobId)
 	self.notify("正在重进...", "warn")
 
 	local mode = modeOverride or self.store:get("rejoin.mode") or "same"
-	local order = if mode == "sparse" or mode == "player" or mode == "private" then "Asc" else "Desc"
-	local servers = if mode == "private" then {} else (Rejoin.fetchServers(self, order) or {})
+	--[[
+		`follow` never fetches the public server list, and never uses one.
+
+		The list is what turns a failed follow into "some other server", which
+		costs the session and gets nobody closer to the player being followed --
+		see core/Follow and ServerPick's `follow` branch. Skipping it also removes
+		a blocking HTTP round trip from the path that has to fire immediately.
+	]]
+	local servers = {}
+	if mode ~= "follow" then
+		local order = if mode == "sparse" or mode == "player" or mode == "private" then "Asc" else "Desc"
+		servers = if mode == "private" then {} else (Rejoin.fetchServers(self, order) or {})
+	end
 
 	-- The player lookup only happens for the mode that needs it, and it is
-	-- cached (PLAYER_CACHE), so a retry loop does not hammer the presence API.
-	local targetJobId = nil
-	if mode == "player" then
+	-- cached (PLAYER_CACHE / PLAYER_MISS_TTL), so a retry loop does not hammer
+	-- the presence API.
+	local targetJobId = exactJobId
+	if mode == "player" and targetJobId == nil then
 		local name = self.store:get("rejoin.targetPlayer")
-		targetJobId = Rejoin.playerJobId(self, if type(name) == "string" then name else "")
-		if targetJobId == nil then
-			self.notify(string.format("找不到目标玩家 %s，按梯度降级", tostring(name or "")), "warn")
+		local jobId, status = Rejoin.playerJobId(self, if type(name) == "string" then name else "")
+		targetJobId = jobId
+		if jobId == nil then
+			self.notify(string.format("找不到目标玩家 %s（%s），按梯度降级",
+				tostring(name or ""), tostring(status)), "warn")
 		end
 	end
 
@@ -13729,13 +14314,34 @@ function Rejoin.hopWatch(self, now)
 	end
 end
 
--- Off-frame wrapper. The only task.spawn in the refactor, and documented above.
-function Rejoin.spawnPerform(self, reason, modeOverride)
+--[[
+	Off-frame wrapper. The HTTP calls a rejoin makes BLOCK, so they must not run
+	on the frame the request arrives: `perform` fetches the server list, and
+	perform can be reached from a scheduler tick inside the Heartbeat callback.
+]]
+function Rejoin.spawnPerform(self, reason, modeOverride, exactJobId)
 	task.spawn(function()
 		pcall(function()
-			Rejoin.perform(self, reason, modeOverride)
+			Rejoin.perform(self, reason, modeOverride, exactJobId)
 		end)
 	end)
+end
+
+--[[
+	Start an urgent rejoin NOW: no countdown, no dialog.
+
+	Split out of `request` for the follow feature, which has already applied the
+	boot grace against the clock the SCHEDULER supplied (see Rejoin.followTick).
+	Re-checking it here against `os.clock()` would mean the grace depended on two
+	different clocks -- and in a headless or stubbed run, where the two differ,
+	the follow would be refused for a reason that has nothing to do with the
+	user's game.
+]]
+function Rejoin.beginUrgent(self, reason, modeOverride, exactJobId)
+	self._state = "running"
+	self._triggered = true
+	Rejoin.spawnPerform(self, reason, modeOverride, exactJobId)
+	return true
 end
 
 --[[
@@ -13745,10 +14351,10 @@ end
 	cancellable countdown. V1007 showed a modal here -- without a UI the countdown
 	is a timer and `cancelPending` is what the modal's Cancel button will call.
 
-	`modeOverride` is threaded through untouched: it is the caller's target server,
-	not this function's business (see Rejoin.perform).
+	`modeOverride` and `exactJobId` are threaded through untouched: they are the
+	caller's target, not this function's business (see Rejoin.perform).
 ]]
-function Rejoin.request(self, reason, urgent, modeOverride)
+function Rejoin.request(self, reason, urgent, modeOverride, exactJobId)
 	if os.clock() - self.startedAt < STARTUP_GRACE then
 		self.notify("游戏正在加载，15 秒内禁止重进", "warn")
 		return false
@@ -13758,10 +14364,7 @@ function Rejoin.request(self, reason, urgent, modeOverride)
 	end
 
 	if urgent then
-		self._state = "running"
-		self._triggered = true
-		Rejoin.spawnPerform(self, reason, modeOverride)
-		return true
+		return Rejoin.beginUrgent(self, reason, modeOverride, exactJobId)
 	end
 
 	self._state = "pending"
@@ -13791,10 +14394,7 @@ function Rejoin.request(self, reason, urgent, modeOverride)
 				self.pendingHandle:cancel()
 				self.pendingHandle = nil
 			end
-			self._state = "running"
-			self._triggered = true
-			Rejoin.spawnPerform(self, reason, modeOverride)
-			return true
+			return Rejoin.beginUrgent(self, reason, modeOverride, exactJobId)
 		end)
 	end
 
@@ -13803,9 +14403,7 @@ function Rejoin.request(self, reason, urgent, modeOverride)
 			return
 		end
 		self.pendingHandle = nil
-		self._state = "running"
-		self._triggered = true
-		Rejoin.spawnPerform(self, reason, modeOverride)
+		Rejoin.beginUrgent(self, reason, modeOverride, exactJobId)
 	end)
 	return true
 end
@@ -13846,6 +14444,147 @@ end
 function Rejoin.requestNow(self, reason, modeOverride)
 	Rejoin.reset(self)
 	return Rejoin.request(self, reason, false, modeOverride)
+end
+
+------------------------------------------------------------------- follow --
+
+--[[
+	IS THE TARGET IN *THIS* SERVER?
+
+	`FindFirstChild` by USERNAME (that is what `Name` is on a Player, and what
+	the config asks for). Cheap enough to ask on every follow decision, and it is
+	the only evidence that does not depend on the network -- which is what makes
+	"he is here, stop following" instant even when the presence API is slow or
+	unavailable.
+
+	CASE-INSENSITIVE, because Roblox usernames are and `FindFirstChild` is not.
+	Without the fallback a user who typed "notch" for "Notch" gets the worst
+	possible behaviour: the presence lookup resolves him, the job id therefore
+	equals ours, and the follow re-checks and gives up ten minutes later while
+	standing right next to the player it was following. The scan runs only when
+	the exact lookup missed, so the common case stays one call.
+]]
+function Rejoin.targetHere(name)
+	if type(name) ~= "string" or name == "" then
+		return false
+	end
+	if Players:FindFirstChild(name) ~= nil then
+		return true
+	end
+	local wanted = string.lower(name)
+	for _, player in ipairs(Players:GetPlayers()) do
+		if string.lower(player.Name) == wanted then
+			return true
+		end
+	end
+	return false
+end
+
+--[[
+	Ask "where is he", off the frame path.
+
+	The lookup BLOCKS (two HTTP round trips), and `followTick` runs inside the
+	Heartbeat callback -- so it runs in a task.spawn, exactly like `perform`, and
+	exactly once at a time: `followLookup` is the guard, because a stuck request
+	must not be joined by a second one every second.
+]]
+function Rejoin.spawnFollowLookup(self, name)
+	if self.followLookup == true then
+		return false
+	end
+	self.followLookup = true
+	task.spawn(function()
+		local ok, jobId, status = pcall(Rejoin.playerJobId, self, name, true)
+		self.followLookup = false
+		if not ok then
+			-- `playerJobId` is guarded internally, so reaching here means an
+			-- engine-level failure; the honest answer is "unknown", which makes
+			-- the decision WAIT rather than act on a guess.
+			self.follow:remember(nil, os.clock(), "unknown")
+			return
+		end
+		self.follow:remember(jobId, os.clock(), status)
+	end)
+	return true
+end
+
+--[[
+	One step of 跟随玩家.
+
+	Returns the decision core/Follow made, which is also what the settings page
+	prints -- so "why is it not following" is answerable from the panel instead
+	of from the source.
+
+	The ORDER of the work matters: the decision is taken first, and only then is
+	the lookup spawned or the rejoin started. Every input is a store read or a
+	local call, so this is safe on the frame path.
+]]
+function Rejoin.followTick(self, now)
+	local store = self.store
+
+	-- Re-read the cadence every step: they are cheap reads and the user can
+	-- retune them while a follow is in progress.
+	Follow.configure(self.follow, {
+		poll = tonumber(store:get("follow.poll")),
+		gap = tonumber(store:get("follow.gap")),
+		waitSeconds = tonumber(store:get("follow.waitSeconds")),
+		maxAttempts = tonumber(store:get("follow.maxAttempts")),
+	})
+
+	local target = store:get("rejoin.targetPlayer")
+	local decision = self.follow:step({
+		enabled = store:get("follow.enabled") == true,
+		target = if type(target) == "string" then target else nil,
+		inThisServer = Rejoin.targetHere(target),
+		currentJobId = game.JobId,
+		-- The boot grace, measured with the clock the SCHEDULER supplied rather
+		-- than os.clock(): `now` is what every other task here is driven by, and
+		-- mixing the two made the grace unmeasurable in a stubbed run.
+		ready = (now - self.startedAt) >= STARTUP_GRACE,
+		busy = self._triggered or self._state ~= "idle",
+		lookupInFlight = self.followLookup == true,
+		now = now,
+	})
+
+	local previous = self.followAction
+	self.followAction = decision.action
+
+	if decision.action == Follow.RESOLVE then
+		Rejoin.spawnFollowLookup(self, target)
+	elseif decision.action == Follow.JOIN then
+		-- URGENT, with no countdown: "立刻加入" is the whole point of the
+		-- feature, and the target's server is only reachable while he is in it.
+		self.notify(decision.reason, "warn")
+		Rejoin.beginUrgent(self, decision.reason, "follow", decision.jobId)
+	elseif decision.action == Follow.STOP and previous ~= Follow.STOP then
+		-- Once per transition: the decision stays "stop" for the rest of the
+		-- session, and a per-tick toast would be a permanent banner.
+		self.notify(decision.reason, "error")
+	end
+
+	return decision
+end
+
+-- What the settings page prints. Reads only; the UI never assigns follow state.
+function Rejoin.followStatus(self)
+	local raw = self.store:get("rejoin.targetPlayer")
+	local target = if type(raw) == "string" then raw else ""
+	local status = Follow.status(self.follow, os.clock())
+	return {
+		enabled = self.store:get("follow.enabled") == true,
+		target = target,
+		inThisServer = Rejoin.targetHere(target),
+		action = status.action,
+		reason = status.reason,
+		attempts = status.attempts,
+		maxAttempts = status.maxAttempts,
+		waited = status.waited,
+		waitLimit = status.waitLimit,
+		resultStatus = status.resultStatus,
+		targetJobId = status.jobId,
+		lookupInFlight = self.followLookup == true,
+		busy = self._triggered or self._state ~= "idle",
+	}
 end
 
 function Rejoin.tick(self, now)
@@ -14012,6 +14751,40 @@ function Rejoin.install(context)
 		end,
 		tick = function(_dt, now)
 			Rejoin.hopWatch(self, now)
+		end,
+	})
+
+	--[[
+		跟随玩家 -- its OWN switch, not a `rejoin.mode`.
+
+		That distinction is the whole fix for "跟随玩家重进失效". As a mode, the
+		feature only decided WHERE an already-triggered rejoin went, and nothing
+		ever triggered one: the player being followed leaving the server is not a
+		memory spike, not a low frame rate and not a timer, so the dropdown did
+		nothing on its own. As a task, the leave IS the trigger.
+
+		Priority 46 runs it after the rejoin triggers (50) and the hop watchdog
+		(48), so `busy` is already accurate when the decision is taken -- a follow
+		must never start a second rejoin beside one that is in flight.
+	]]
+	self.scheduler:register({
+		id = "followPlayer",
+		priority = 46,
+		enabled = function()
+			return store:get("follow.enabled") == true
+		end,
+		onDisable = function()
+			-- Switching it off is a full stop: no half-armed wait, no spent
+			-- attempt budget handed to the next enable.
+			Follow.reset(self.follow)
+			self.followAction = nil
+		end,
+		tick = function(_dt, now)
+			if now - (self.followAt or 0) < FOLLOW_TICK then
+				return
+			end
+			self.followAt = now
+			Rejoin.followTick(self, now)
 		end,
 	})
 
@@ -17389,20 +18162,31 @@ function Shell.applySize(self, instant)
 	end
 
 	--[[
-		A width/height change can push the window past the screen edge, so the
-		position is re-clamped here too -- deferred until the new size has been
-		laid out, because `AbsolutePosition`/`AbsoluteSize` are only meaningful
-		after the property writes above have propagated.
+		Every geometry pass ENDS here, with the position re-derived from the store.
 
-		Deliberately does NOT save afterwards: the stored position may be exactly
-		what the user chose, and silently rewriting it because they resized the
-		window would lose their placement. Only a DRAG persists (see bindDrag).
+		Deferred until the new size has been laid out, because
+		`AbsolutePosition`/`AbsoluteSize` are only meaningful after the property
+		writes above have propagated -- and, for the `instant` path, until the
+		entrance animation (0.32 s of UIScale) has landed, since the clamp needs
+		the FINAL rendered size to decide whether the window fits.
+
+		`reapplyPosition` replaces the old bare `clampOnScreen` call: a nudge from
+		wherever the window happens to be cannot repair a position that the store
+		never agreed to, and repairing exactly that is the point (see its own
+		note). It also writes the clamped value back, so what is on screen is what
+		the next session restores.
 	]]
-	self:delay(if instant then 0.05 else 0.26, function()
+	self:delay(if instant then 0.35 else 0.26, function()
 		if self.destroyed then
 			return
 		end
-		Shell.clampOnScreen(self)
+		Shell.reapplyPosition(self, false)
+		-- The info panel is placed relative to this window's rect, so it has to
+		-- be re-placed once that rect has settled (the shell does not own the
+		-- panel, hence the callback).
+		if self.onGeometrySettled ~= nil then
+			pcall(self.onGeometrySettled)
+		end
 	end)
 end
 
@@ -17443,18 +18227,205 @@ function Shell.applyFontScale(self)
 end
 
 --[[
-	Keep the window on screen after a drag, a resize, or a display change.
+	The viewport, but only when it can be trusted.
+
+	Both the clamp and the panel placement are computed against this, and a
+	viewport the engine reported while the client was still loading is exactly
+	the kind of input that must not be acted on: the window would be pulled
+	somewhere the user never put it, and the store -- which is what the NEXT
+	session restores -- would still be holding the old coordinate. That mismatch
+	is the reported "每次重进后窗口位置异常位移".
+
+	A camera with no usable size answers nil rather than a default, so a caller
+	cannot accidentally clamp against 0x0 and shove the window into the corner.
+]]
+function Shell.viewport(self)
+	local camera = Workspace.CurrentCamera
+	if camera == nil then
+		return nil
+	end
+	local viewport = camera.ViewportSize
+	if viewport == nil or type(viewport.X) ~= "number" or type(viewport.Y) ~= "number" then
+		return nil
+	end
+	if viewport.X < 320 or viewport.Y < 240 then
+		return nil
+	end
+	return viewport
+end
+
+--[[
+	Where the STORE says the window's centre is.
+
+	This is the single source of truth for the position (the project's own rule:
+	state lives in the Store). The live `main.Position` is not it -- several
+	things move the window without writing the store (the entrance animation, a
+	morph, a clamp), and a session that trusted the live value came back in a
+	different place every time.
+]]
+function Shell.positionFromStore(self): UDim2
+	local saved = self.store:get("uiState.savedMain")
+	if type(saved) ~= "table" then
+		return UDim2.new(0.5, 0, 0.5, 0)
+	end
+	return UDim2.new(saved.xs or 0.5, saved.xo or 0, saved.ys or 0.5, saved.yo or 0)
+end
+
+-- Keep a centre inside `[size/2, extent - size/2]`. When the window is larger
+-- than the screen there is no such interval, so it is centred instead of being
+-- pushed to an edge it does not fit into either.
+local function clampCentre(centre: number, size: number, extent: number): number
+	local half = size / 2
+	if size >= extent then
+		return extent / 2
+	end
+	if centre < half then
+		return half
+	end
+	if centre > extent - half then
+		return extent - half
+	end
+	return centre
+end
+
+-- Move the window there, tweened unless the caller says otherwise. Deliberately
+-- NOT a store write: `reapplyPosition` owns that decision.
+function Shell.setPosition(self, target: UDim2, animate: boolean?)
+	if self.main == nil or self.destroyed then
+		return
+	end
+	if animate ~= true or self.main.Position == target then
+		self.main.Position = target
+		return
+	end
+	self.kit:tween(self.main, 0.2, { Position = target }, Enum.EasingStyle.Quint)
+end
+
+--[[
+	PUT THE WINDOW WHERE THE STORE SAYS IT GOES, clamped into a usable viewport.
+
+	Every geometry pass ends here, and it is deliberately NOT `clampOnScreen`:
+
+	  * `clampOnScreen` nudges the window from wherever it currently IS, so a
+	    position the store never agreed to can survive a whole session -- and
+	    because the next session restores the STORE value, the window came back
+	    somewhere else. This function ignores the live position entirely and
+	    re-derives it, which is what makes the position reproducible across a
+	    rejoin.
+	  * when the clamp DOES move it (the saved coordinate does not fit this
+	    screen), the clamped value is written BACK, so what is on screen is what
+	    will be restored instead of the coordinate that did not fit.
+
+	Returns true when it had to move the window.
+]]
+function Shell.reapplyPosition(self, animate)
+	if self.main == nil or self.destroyed then
+		return false
+	end
+
+	-- The pill is a different shape with its own remembered position; deriving
+	-- from `savedMain` here would jump it to where the WINDOW belongs.
+	if self.pill == true then
+		return Shell.clampOnScreen(self)
+	end
+
+	local target = Shell.positionFromStore(self)
+	local viewport = Shell.viewport(self)
+	if viewport == nil then
+		-- Nothing trustworthy to clamp against: apply the stored value verbatim
+		-- rather than guessing from a bad viewport.
+		Shell.setPosition(self, target, false)
+		return false
+	end
+
+	-- The RENDERED size, which includes the UIScale (the window's Size is stored
+	-- in unscaled units).
+	local size = self.main.AbsoluteSize
+	local width = if size ~= nil and type(size.X) == "number" then size.X else 0
+	local height = if size ~= nil and type(size.Y) == "number" then size.Y else 0
+	if width <= 0 or height <= 0 then
+		local state = Shell.visualState(self)
+		local scale = if self.mainScale ~= nil then self.mainScale.Scale else 1
+		width = state.layout.width * scale
+		height = state.layout.height * scale
+	end
+
+	local centreX = target.X.Scale * viewport.X + target.X.Offset
+	local centreY = target.Y.Scale * viewport.Y + target.Y.Offset
+	local clampedX = clampCentre(centreX, width, viewport.X)
+	local clampedY = clampCentre(centreY, height, viewport.Y)
+	local moved = math.abs(clampedX - centreX) > 1 or math.abs(clampedY - centreY) > 1
+
+	if moved then
+		-- Persist the clamped coordinate and let the `uiState.savedMain`
+		-- subscriber move the window: ONE place writes the position, so the two
+		-- cannot disagree again. (The value is written as absolute offsets --
+		-- the same shape the info panel uses -- which is exactly "this spot on
+		-- this screen".)
+		self.store:set("uiState.savedMain", {
+			xs = 0,
+			xo = math.floor(clampedX + 0.5),
+			ys = 0,
+			yo = math.floor(clampedY + 0.5),
+		})
+		return true
+	end
+
+	Shell.setPosition(self, target, animate == true)
+	return false
+end
+
+--[[
+	The main window's rect as GEOMETRY says it will be, not as the screen
+	currently shows it.
+
+	`PanelPlacement` decides which side of the main window the info panel goes on,
+	and it used to be handed `main.AbsolutePosition/AbsoluteSize` -- the LIVE
+	values. Read while the shell is mid-tween (the entrance animation, a clamp, a
+	morph) those describe a rectangle the window is only passing through, so the
+	SAME saved panel position resolved to a different side from one session to the
+	next. Deriving the rect from the store and the computed size makes the
+	placement reproducible, which is the other half of "重进后位置异常位移".
+]]
+function Shell.mainRect(self)
+	if self.main == nil or self.pill == true then
+		return nil
+	end
+	local viewport = Shell.viewport(self)
+	if viewport == nil then
+		return nil
+	end
+	local state = Shell.visualState(self)
+	local scale = if self.mainScale ~= nil then self.mainScale.Scale else 1
+	local width = state.layout.width * scale
+	local height = state.layout.height * scale
+	local target = Shell.positionFromStore(self)
+	local centreX = target.X.Scale * viewport.X + target.X.Offset
+	local centreY = target.Y.Scale * viewport.Y + target.Y.Offset
+	return {
+		x = centreX - width / 2,
+		y = centreY - height / 2,
+		w = width,
+		h = height,
+	}
+end
+
+--[[
+	Keep the window on screen after a drag, or after a shape change.
 
 	Returns true when it actually moved the window (i.e. a tween is in flight),
 	so a caller that persists the position can wait for the move to land instead
 	of saving an intermediate coordinate.
+
+	This is the "nudge from where it is" half, which is right for a drag (the
+	user's cursor decided where it is) and for a morph. The AUTHORITATIVE
+	position pass is `reapplyPosition`.
 ]]
 function Shell.clampOnScreen(self)
-	local camera = Workspace.CurrentCamera
-	if camera == nil then
+	local viewport = Shell.viewport(self)
+	if viewport == nil then
 		return false
 	end
-	local viewport = camera.ViewportSize
 	local position = self.main.AbsolutePosition
 	local size = self.main.AbsoluteSize
 	local dx, dy = 0, 0
@@ -18482,11 +19453,11 @@ function Shell.bindStore(self)
 				if self.destroyed then
 					return
 				end
+				-- `applySize` ends in `reapplyPosition`, which re-derives the
+				-- position from the store for the NEW viewport -- so a resolution
+				-- change cannot leave the panel somewhere the store disagrees
+				-- with, and it does not need a separate clamp here.
 				Shell.applySize(self)
-				-- A shrink can push the window off the new viewport; a resolution
-				-- change that leaves the panel unreachable is the same class of
-				-- problem as dragging it there.
-				Shell.clampOnScreen(self)
 			end)
 		end))
 	end
@@ -20224,15 +21195,24 @@ end
 	Put the panel somewhere that does not cover the main window.
 
 	The decision is core/PanelPlacement; this only gathers the rectangles.
+
+	The main window's rect comes from `Shell.mainRect` -- the geometry the shell
+	COMPUTED -- rather than from `main.AbsolutePosition/AbsoluteSize`. The live
+	values are mid-tween for most of the first second of a session (the entrance
+	animation, the clamp that follows it), and a placement decided from a
+	rectangle the window was only passing through is not reproducible: the same
+	saved panel position resolved to a different side every time the script
+	reloaded (the reported "重进后位置异常位移"). `mainRect` is derived from the
+	store and the computed size, so the answer is the same every session.
 ]]
 function InfoWindow.place(self)
 	local screen = screenSize()
 	local main = self.shell.main
 	local mainRect = nil
 	if main ~= nil and main.Visible and not self.shell.pill then
-		local position = main.AbsolutePosition
-		local size = main.AbsoluteSize
-		mainRect = { x = position.X, y = position.Y, w = size.X, h = size.Y }
+		if self.shell.mainRect ~= nil then
+			mainRect = self.shell:mainRect()
+		end
 	end
 
 	local saved = self.store:get("uiState.savedInfo")
@@ -23231,6 +24211,13 @@ Page.build = function(kit, page, shell)
 		default = "same",
 		map = { toStore = rejoinToStore, fromStore = rejoinFromStore },
 	})
+	--[[
+		The two are easy to confuse, and confusing them is the reported failure:
+		"目标玩家所在服务器" is a MODE (it only chooses where an already triggered
+		rejoin lands), while 跟随玩家 is the feature that triggers one. Saying so
+		here is cheaper than a user concluding the feature is broken.
+	]]
+	kit:note(rejoin, "「目标玩家所在服务器」只对手动 / 定时重进生效；要跟着玩家走请开下面的「跟随玩家」")
 	kit:textInput(rejoin, {
 		label = "私服 code",
 		path = "rejoin.privId",
@@ -23240,15 +24227,17 @@ Page.build = function(kit, page, shell)
 	--[[
 		目标玩家.
 
-		Read by `rejoin.mode == "player"`; an unknown / offline / other-place player
-		falls through the gradient chain instead of failing the rejoin.
+		Read by BOTH `rejoin.mode == "player"` (manual/timed rejoins: an unknown /
+		offline / other-place player falls through the gradient chain) and the
+		跟随玩家 feature below (which waits instead of falling through, and only
+		ever moves to this player's server). One name, one place to type it.
 	]]
 	kit:textInput(rejoin, {
 		label = "目标玩家用户名",
 		path = "rejoin.targetPlayer",
 		default = "",
 		placeholder = "例如 Notch",
-		hint = "找不到该玩家时：私服 → 人少的服务器 → 原服务器",
+		hint = "重进目标选「目标玩家所在服务器」或开着「跟随玩家」时都用这个名字",
 	})
 	kit:toggle(rejoin, { label = "紧急重进（掉线 / 报错弹窗）", path = "rejoin.emergEnabled" })
 	kit:divider(rejoin)
@@ -23271,6 +24260,103 @@ Page.build = function(kit, page, shell)
 			end
 		end,
 	})
+
+	--[[
+		跟随玩家.
+
+		Separate from 重进目标 on purpose, and the note says why: as a MODE it
+		could only choose where an already-triggered rejoin went, and nothing
+		triggered one when the followed player left -- which is exactly the
+		"跟随玩家重进失效" this replaces. As a switch it IS the trigger.
+	]]
+	kit:divider(rejoin)
+	local followService = services.rejoin
+	kit:toggle(rejoin, {
+		label = "跟随玩家",
+		path = "follow.enabled",
+		hint = "开着它：目标玩家一走就盯着他；他上线且在别的服务器时立刻跟过去，不在游戏里就等着",
+	})
+	kit:note(rejoin, "跟随使用上面的「目标玩家用户名」；只去他的服务器，不会随便换服")
+	kit:slider(rejoin, {
+		label = "查询间隔（秒）",
+		path = "follow.poll",
+		min = 2,
+		max = 300,
+		default = 10,
+		commitOnly = true,
+		hint = "目标不在游戏里时，隔多久查一次他上线了没有",
+	})
+	kit:slider(rejoin, {
+		label = "重试下限（秒）",
+		path = "follow.gap",
+		min = 5,
+		max = 600,
+		default = 30,
+		commitOnly = true,
+		hint = "两次尝试加入之间的最短间隔（目标服满员会失败）",
+	})
+	kit:input(rejoin, {
+		label = "最长等待（秒）",
+		path = "follow.waitSeconds",
+		min = 30,
+		max = 7200,
+		default = 600,
+		hint = "等这么久还查不到他在游戏里就停止跟随",
+	})
+	kit:input(rejoin, {
+		label = "最多尝试次数",
+		path = "follow.maxAttempts",
+		min = 1,
+		max = 20,
+		default = 4,
+		hint = "一次游戏里最多尝试加入几次",
+	})
+
+	local followLabel = kit:instance("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 32),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamMedium,
+		Text = "跟随状态：未启用",
+		TextColor3 = kit:color("TextSecond"),
+		TextSize = 12,
+		TextWrapped = true,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Top,
+		LayoutOrder = kit:nextOrder(rejoin),
+	}, rejoin)
+
+	--[[
+		The live read-out, because "跟随没生效" is otherwise unanswerable: it shows
+		whether he is in this server, what the last decision was, how long it has
+		been waiting and how many attempts are left.
+	]]
+	shell:addUiTick(function()
+		if followService == nil or followService.followStatus == nil then
+			return
+		end
+		local status = followService:followStatus()
+		if not status.enabled then
+			followLabel.Text = "跟随状态：未启用"
+			followLabel.TextColor3 = kit:color("TextMuted")
+			return
+		end
+		if status.target == "" then
+			followLabel.Text = "跟随状态：请先填「目标玩家用户名」"
+			followLabel.TextColor3 = kit:color("Yellow")
+			return
+		end
+		local extra = ""
+		if status.attempts > 0 then
+			extra = string.format(" · 已尝试 %d/%d", status.attempts, status.maxAttempts)
+		end
+		if status.waited > 0 and status.action ~= "watch" then
+			extra = extra .. string.format(" · 已等待 %d 秒", math.floor(status.waited))
+		end
+		followLabel.Text = string.format("跟随状态：%s%s\n%s", tostring(status.action), extra, tostring(status.reason))
+		followLabel.TextColor3 = if status.inThisServer or status.action == "watch"
+			then kit:color("Green")
+			else kit:color("TextSecond")
+	end)
 
 	kit:section(page, "自我操作")
 	local self_ops = kit:card(page)
@@ -24584,6 +25670,22 @@ function Main.start()
 				return
 			end
 			InfoWindow.resetPlacement(infoWindow)
+		end
+
+		--[[
+			The panel is placed relative to the main window's rect, so it has to be
+			re-placed once that rect settles: a viewport change or a width/height
+			edit moves the main window under a panel that was placed to avoid it.
+
+			Wired here rather than inside the shell because the shell does not own
+			the panel -- and the callback stays nil until the panel exists, which
+			the shell already tolerates (it pcall-guards the field).
+		]]
+		shell.onGeometrySettled = function()
+			if infoWindow == nil then
+				return
+			end
+			InfoWindow.place(infoWindow)
 		end
 
 		--[[
