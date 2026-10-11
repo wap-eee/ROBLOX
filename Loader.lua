@@ -3,7 +3,7 @@
 --  MKUltraHUB -- GENERATED BUNDLE. DO NOT EDIT.
 --  Source of truth: src\**\*.luau   Builder: tools\bundle.ps1
 --  Modules: 68   Entry: main
---  Generated: 2026-10-10 23:16:18
+--  Generated: 2026-10-11 10:33:17
 -- ===========================================================================
 
 local __modules = {}
@@ -1216,6 +1216,15 @@ local SCHEMA: { Spec } = {
 		not the boss's 70 studs (which is `boss.hoverHeight`).
 	]]
 	num("kill.hoverHeight", 12, 1, 200),
+	--[[
+		DIRECT 0.025 s PIN while approaching a PLAYER target.
+
+		Separate from `boss.directPin` on purpose: the two features chase
+		different objects with their own positions and their own timers, so one
+		switch for both would mean tuning one breaks the other. This one can be
+		turned off if a particular place dislikes the write rate.
+	]]
+	bool("kill.directPin", true),
 	bool("kill.lookDown", true),
 	bool("kill.targetSizeEnabled", false),
 	num("kill.targetSizeMul", 5, 1, 20),
@@ -1269,6 +1278,15 @@ local SCHEMA: { Spec } = {
 		event bosses on, saw them alive, and killed every one of them.
 	]]
 	enm("boss.priority", "event", BOSS_PRIORITY),
+	--[[
+		DIRECT 0.025 s PIN while hovering on a boss.
+
+		The user's requirement is a write every 0.025 s with the facing set in the
+		same write, and it is a setting rather than a constant because it is the
+		one thing to switch off if a place reacts badly to the write rate (it is
+		independent of `kill.directPin`: different target, different timer).
+	]]
+	bool("boss.directPin", true),
 	bool("boss.event.enabled", true),
 	-- Superseded: each event boss now carries its own fixed hover height
 	-- (BossInfo.EVENTS). Live key, same reasoning as `boss.hoverHeight` above.
@@ -3487,7 +3505,16 @@ export type ChestTimer = {
 }
 
 ChestTimer.DEFAULT_DELAY = 3
-ChestTimer.DEFAULT_WINDOW = 30
+--[[
+	How long after a boss death the chest is still worth chasing.
+
+	Was 30 seconds, which is short when the approach has to be retried (a walk
+	that lands in the void, a prompt somebody else is standing in): the reported
+	"有的时候会漏开宝箱" is a window that expired while the character was still
+	being put back in range. A minute is the compromise -- long enough for a
+	retry, still short enough that an old death position is not chased forever.
+]]
+ChestTimer.DEFAULT_WINDOW = 60
 
 function ChestTimer.new(options: Options?): ChestTimer
 	local opts: Options = options or {}
@@ -6325,6 +6352,34 @@ function Remotes.machine()
 	return exactOrKeyword("machineInteractRemote", "machineinteractremote", 5)
 end
 
+--[[
+	THE AREA TRAVEL REMOTE, and the circle it is called with.
+
+	This is the game's own "move me to another gym" call -- the same one its
+	Travel menu uses:
+
+	    local args = { "travelToArea", workspace.areaCircles.hallowedGymCircle }
+	    ReplicatedStorage.rEvents.areaTravelRemote:InvokeServer(unpack(args))
+
+	It is a RemoteFunction, so callers must treat it as YIELDING (see
+	game/Boss.requestTravel). The circle is what selects the destination, so both
+	halves are looked up together here rather than in the caller.
+]]
+function Remotes.areaTravel()
+	return exactOrKeyword("areaTravelRemote", "areatravelremote", 5)
+end
+
+-- `Workspace.areaCircles.hallowedGymCircle` -- the Hallowed Gym destination.
+-- Returns nil when the game is not running the seasonal area at all, which the
+-- caller reports instead of teleporting somewhere arbitrary.
+function Remotes.hallowedGymCircle()
+	local circles = Workspace:FindFirstChild("areaCircles")
+	if circles == nil then
+		return nil
+	end
+	return circles:FindFirstChild("hallowedGymCircle")
+end
+
 function Remotes.clear()
 	table.clear(cache)
 	table.clear(lastScan)
@@ -7806,6 +7861,124 @@ function Teleport.walk(self, target, options): boolean
 	return true
 end
 
+--[[
+	A single-frame move: write the position now, once.
+
+	For callers that re-issue it at a high rate -- the loop teleport does it every
+	0.025 s, the boss pin every frame -- planning a staged path each time would be
+	pure overhead, because the next write replaces the previous one anyway. This
+	is the "snap" the user's reference implementation does
+	(`hrp.CFrame = CFrame.new(pos)`), and it is why the loop/approach feel instant
+	instead of easing there over half a second.
+
+	Any staged walk in flight is cancelled first: it would otherwise keep writing
+	the old waypoints between two snaps.
+]]
+function Teleport.snap(self, target): boolean
+	if typeof(target) ~= "Vector3" then
+		return false
+	end
+	local root = self.character:requireRoot()
+	if root == nil then
+		return false
+	end
+	Teleport.cancel(self)
+
+	--[[
+		A motion HOLD would overwrite this write on the very next RenderStepped
+		(`Motion.apply` rewrites the CFrame to `self.pos` every frame), so a stale
+		hold has to go: the callers of `snap` are exactly the ones that own the
+		body outright -- the loop teleport and the staging hop before an area
+		travel. `finish` is a no-op when no hold is active.
+	]]
+	if self.motion ~= nil then
+		pcall(function()
+			self.motion:finish()
+		end)
+	end
+
+	local entry = self.character:current()
+	if entry ~= nil and entry.PrimaryPart ~= nil then
+		pcall(function()
+			entry:PivotTo(CFrame.new(target))
+		end)
+	else
+		pcall(function()
+			root.CFrame = CFrame.new(target)
+		end)
+	end
+	pcall(function()
+		root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+	end)
+	pcall(function()
+		root.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+	end)
+	return true
+end
+
+--[[
+	PIN: write the POSITION AND THE FACING, now, for callers that re-issue it on a
+	0.025 s cadence (the boss hover, the kill approach).
+
+	Why this exists next to the motion hold: the hold writes once per
+	RenderStepped, but `Motion.apply` only runs while a hold is active, and the
+	hold has verify/retry bookkeeping around it (samples, drift streaks). The
+	pin is unconditional and immediate, so "贴上去" cannot be delayed by that
+	bookkeeping -- and it sets the ROTATION in the same write, which is what makes
+	the punch actually land on the target instead of over its shoulder.
+
+	`bias` is the downward gaze (Vector3.new(0, -1, 0) = the legacy 45 degrees); a
+	nil bias keeps the horizontal aim.
+]]
+function Teleport.pin(self, target, look, bias): boolean
+	if typeof(target) ~= "Vector3" then
+		return false
+	end
+	local root = self.character:requireRoot()
+	if root == nil then
+		return false
+	end
+
+	local cf
+	if typeof(look) == "Vector3" then
+		if typeof(bias) == "Vector3" then
+			local flat = look - target
+			flat = Vector3.new(flat.X, 0, flat.Z)
+			local direction = if flat.Magnitude > 0.1 then flat.Unit else Vector3.new(0, 0, -1)
+			cf = CFrame.lookAt(target, target + (direction + bias).Unit)
+		else
+			cf = CFrame.lookAt(target, look)
+		end
+	else
+		cf = CFrame.new(target)
+	end
+
+	--[[
+		ROOT CFrame ONLY -- deliberately no `PivotTo`.
+
+		An earlier revision of this function pivoted the whole model as well, and
+		that is the plausible reason the user found "新版经常打不到 Boss，还没有上
+		个版本打得到": `PivotTo` moves every limb and re-seats the assembly, and
+		done 40 times a second it fights the humanoid's own state machine and the
+		punch animation -- while the punch itself is aimed from the ROOT. The
+		reference implementation writes `hrp.CFrame` and nothing else, and so does
+		this now.
+
+		`Motion.apply` can get away with `PivotTo` because it runs once per frame
+		and only to repair a model that has come apart; a 0.025 s pin cannot.
+	]]
+	pcall(function()
+		root.CFrame = cf
+	end)
+	pcall(function()
+		root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+	end)
+	pcall(function()
+		root.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+	end)
+	return true
+end
+
 function Teleport.stats(self)
 	return {
 		arrivals = self.arrivals,
@@ -7899,21 +8072,26 @@ function Teleport.install(context)
 			Teleport.cancel(self)
 		end,
 		tick = function(_dt, now)
-			if now - (self.lastLoop or 0) < 0.5 then
+			--[[
+				0.025 s, and a SNAP rather than a staged walk.
+
+				The user's number, and the reason is the reported "关掉再打开就只能
+				传送一次": the old tick skipped whenever `farFromCurrent` thought the
+				held position was already the destination -- and after the first
+				teleport it always was, so the loop idled forever. Snapping at
+				0.025 s simply re-asserts the destination, which is what "循环传送"
+				means and what the reference implementation does with a per-frame
+				CFrame write.
+			]]
+			if now - (self.lastLoop or 0) < 0.025 then
 				return
 			end
 			self.lastLoop = now
-			if Teleport.isBusy(self) then
-				return
-			end
 			local entry = Teleports.byIndex(store:get("tp.loopIdx"))
 			if entry == nil then
 				return
 			end
-			local target = Vector3.new(entry.x, entry.y, entry.z)
-			if farFromCurrent(self, target) then
-				Teleport.walk(self, target, { mode = "tp", arc = 220 })
-			end
+			Teleport.snap(self, Vector3.new(entry.x, entry.y, entry.z))
 		end,
 	})
 
@@ -8654,6 +8832,11 @@ local PUNCH_MISSING_GRACE = 1.5
 ]]
 local BOSS_PUNCH_INTERVAL = 0.05
 
+-- How often the approach pose is written DIRECTLY (position + facing) while
+-- chasing a player. The user's number is 0.025 s, and this subsystem keeps its
+-- OWN timestamp (`self.pinAt`) so it never shares a timer with the boss hover.
+local PIN_INTERVAL = 0.025
+
 local function localPlayer()
 	return Players.LocalPlayer
 end
@@ -8801,6 +8984,12 @@ function Combat.new(context)
 			rebirth one). The swap is what "自动换宠" means to the user.
 		]]
 		pets = context.pets or nil,
+		-- The teleport kernel, for the 0.025 s direct pin (`Teleport.pin`). Its
+		-- OWN `pinAt` timestamp lives on this subsystem: the boss hover has one
+		-- too, and the two must not share a timer (different target, different
+		-- cadence under load).
+		teleport = context.teleport or nil,
+		pinAt = 0,
 		lastPresetKey = nil,
 		-- Friend-whitelist state, refreshed through the external contract.
 		friendIds = {},
@@ -9161,19 +9350,39 @@ function Combat.attack(self, target)
 		]]
 		local height = tonumber(self.store:get("kill.hoverHeight")) or 12
 		local destination = targetPosition + Vector3.new(0, math.max(1, height), 0)
+		local bias = if self.store:get("kill.lookDown") == false then nil else Vector3.new(0, -1, 0)
+
+		--[[
+			THE DIRECT PIN, ON ITS OWN TIMER.
+
+			Deliberately NOT the boss's: this chases a PLAYER, whose position is
+			re-read every attack tick, and the two features run at the same time
+			during a boss fight that also kills players. Sharing one timestamp
+			would make each feature's pin starve the other's, which is why `pinAt`
+			lives on this subsystem and the boss has its own (see Boss.approach).
+
+			0.025 s, position AND facing in the same write. `kill.directPin` turns
+			it off for a place that dislikes the rate; the motion hold below still
+			corrects the pose every frame either way.
+		]]
+		if self.teleport ~= nil and self.store:get("kill.directPin") ~= false then
+			local stamp = os.clock()
+			if stamp - (self.pinAt or 0) >= PIN_INTERVAL then
+				self.pinAt = stamp
+				self.teleport:pin(destination, targetPosition, bias)
+			end
+		end
+
 		self.motion:setTarget(destination)
 		if not self.motion:isActive() then
 			self.motion:begin({
 				pos = destination,
 				mode = "combat",
 				look = targetPosition,
-				lookBias = if self.store:get("kill.lookDown") == false then nil else Vector3.new(0, -1, 0),
+				lookBias = bias,
 			})
 		end
-		self.motion:setLook(
-			targetPosition,
-			if self.store:get("kill.lookDown") == false then nil else Vector3.new(0, -1, 0)
-		)
+		self.motion:setLook(targetPosition, bias)
 	else
 		local flat = Vector3.new(targetPosition.X - myPosition.X, 0, targetPosition.Z - myPosition.Z)
 		if flat.Magnitude > 0.1 then
@@ -9650,6 +9859,12 @@ local VirtualInputManager = game:GetService("VirtualInputManager")
 local BossInfo = require("core/BossInfo")
 local ChestTimer = require("core/ChestTimer")
 local Pets = require("game/Pets")
+local Remotes = require("game/Remotes")
+-- The Teleport MODULE (not the instance in `self.teleport`): the boss pin needs
+-- `isBusy` / `cancel` / `snap`, which are module functions.
+local Teleport = require("game/Teleport")
+
+local Players = game:GetService("Players")
 
 local Boss = {}
 Boss.__index = Boss
@@ -9811,6 +10026,13 @@ function Boss.new(context)
 		eventSeenAt = 0,
 		clearedAt = 0,
 		hopRequested = false,
+		-- "get me into the Hallowed Gym first" bookkeeping. See Boss.ensureArena.
+		travelAt = 0,
+		travelTries = 0,
+		travelGaveUp = false,
+		travelWarned = false,
+		-- Last direct hover write (`Teleport.pin`), on the 0.025 s cadence.
+		pinAt = 0,
 	}, Boss)
 	return self
 end
@@ -10238,6 +10460,189 @@ function Boss.info(self)
 end
 
 --[[
+	ARE WE IN THE HALLOWED GYM?
+
+	`Players.<me>.currentMap` is the game's own answer -- a StringValue whose live
+	value while standing in the event gym is "Hallowed Gym" -- and the character's
+	`InHalloweenArena` attribute is the fallback for a build that renames the
+	display string. Both are read fresh, because this decides whether the fight
+	may start at all.
+]]
+local function inHallowedGym(): boolean
+	local user = Players.LocalPlayer
+	if user ~= nil then
+		local map = user:FindFirstChild("currentMap")
+		if map ~= nil and map:IsA("StringValue") then
+			local name = string.lower(tostring(map.Value))
+			if string.find(name, "hallowed", 1, true) ~= nil
+				or string.find(name, "halloween", 1, true) ~= nil then
+				return true
+			end
+		end
+		local character = user.Character
+		if character ~= nil and character:GetAttribute("InHalloweenArena") == true then
+			return true
+		end
+	end
+	return false
+end
+
+local ARENA_REACH = 250
+-- How often the hover pose is written directly. The user's number: 0.025 s.
+local PIN_INTERVAL = 0.025
+local TRAVEL_RETRY = 4
+local TRAVEL_ATTEMPT_LIMIT = 3
+--[[
+	THE STAGING POINT, and why the travel is not fired from anywhere.
+
+	The user's sequence is: walk to 283, 19, 372 FIRST, and only then fire
+	`areaTravelRemote`. Firing it from wherever the player happens to be does not
+	take (the reported "前往 boss 前并没有按我的要求先传送到我给你的坐标，然后再
+	触发传送门的 Event"), so the staging point is part of the protocol.
+]]
+local HALLOWED_STAGING = Vector3.new(283, 19, 372)
+local STAGING_REACH = 25
+-- Fast, because the walk to the staging point is a snap now, not a staged path.
+local STAGING_RETRY = 0.5
+
+-- Are we standing on the staging point?
+function Boss.atStaging(self): boolean
+	local root = self.character:requireRoot()
+	if root == nil then
+		return false
+	end
+	local ok, position = pcall(function()
+		return root.Position
+	end)
+	if not ok or typeof(position) ~= "Vector3" then
+		return false
+	end
+	return (position - HALLOWED_STAGING).Magnitude <= STAGING_REACH
+end
+
+-- Walk to the staging point. Returns true once we are standing on it.
+function Boss.goToStaging(self): boolean
+	if Boss.atStaging(self) then
+		return true
+	end
+	if self.teleport ~= nil then
+		-- A SNAP, not a walked path: the very next step fires the area travel,
+		-- and a half-second walk there would only delay it (and could be
+		-- cancelled by it).
+		self.teleport:snap(HALLOWED_STAGING)
+	end
+	return false
+end
+
+--[[
+	Travel to the Hallowed Gym through the game's own remote.
+
+	The user's snippet, kept in shape:
+
+	    local args = { "travelToArea", workspace.areaCircles.hallowedGymCircle }
+	    ReplicatedStorage.rEvents.areaTravelRemote:InvokeServer(unpack(args))
+
+	`InvokeServer` on a RemoteFunction YIELDS, and this is reached from a
+	scheduler tick that runs inside the Heartbeat callback -- invoking it inline
+	would stall the whole frame loop (every task, plus the network flush) for a
+	whole network round trip. So it runs in a task.spawn, the same reasoning as
+	Rejoin's blocking HTTP call.
+]]
+function Boss.requestTravel(self): boolean
+	--[[
+		STEP 1: THE STAGING POINT.
+
+		Nothing is fired until we are standing on 283, 19, 372; the caller waits a
+		beat and comes back (the retry interval is short while staging).
+	]]
+	if not Boss.goToStaging(self) then
+		return false
+	end
+
+	-- STEP 2: the remote.
+	local remote = Remotes.areaTravel()
+	local circle = Remotes.hallowedGymCircle()
+	if remote == nil or circle == nil then
+		self.notify("找不到 areaTravelRemote / hallowedGymCircle，无法自动前往万圣节健身房", "warn")
+		return false
+	end
+	task.spawn(function()
+		pcall(function()
+			if remote:IsA("RemoteFunction") then
+				remote:InvokeServer("travelToArea", circle)
+			else
+				remote:FireServer("travelToArea", circle)
+			end
+		end)
+	end)
+	return true
+end
+
+--[[
+	DO NOT PUNCH AN EVENT BOSS FROM OUTSIDE THE ARENA.
+
+	The user's rule: before fighting a seasonal boss, if the game's own data says
+	we are not in "Hallowed Gym", travel there first -- fighting from outside the
+	arena is how the character ends up dead instead of farming.
+
+	Returns true when it is safe to proceed this frame. Three exits, so a broken
+	remote cannot stall the feature forever:
+
+	  * the map says Hallowed Gym                     -> proceed
+	  * the target boss is already within ARENA_REACH  -> proceed (the map string
+	    is the thing that is stale, not the position)
+	  * TRAVEL_ATTEMPT_LIMIT tries and still not there -> warn once, proceed
+	  * otherwise                                     -> ask the remote, wait
+
+	The wait is rate limited (TRAVEL_RETRY), so a travel that takes a moment does
+	not fire the remote every frame.
+]]
+function Boss.ensureArena(self, now, info, position): boolean
+	if inHallowedGym() then
+		self.travelAt = 0
+		self.travelTries = 0
+		self.travelGaveUp = false
+		self.travelWarned = false
+		return true
+	end
+
+	if typeof(info.position) == "Vector3" and typeof(position) == "Vector3"
+		and (position - info.position).Magnitude <= ARENA_REACH then
+		return true
+	end
+
+	if (self.travelTries or 0) >= TRAVEL_ATTEMPT_LIMIT then
+		if self.travelGaveUp ~= true then
+			self.travelGaveUp = true
+			self.notify("多次传送都没到万圣节健身房，仍尝试直接打（检查 areaTravelRemote）", "warn")
+		end
+		return true
+	end
+
+	--[[
+		Two speeds, because there are two phases: getting to the staging point is
+		a snap and may need a beat or two, while waiting out an actual area travel
+		(which teleports the whole server-side character) takes seconds.
+	]]
+	local staging = Boss.atStaging(self)
+	local wait = if staging then TRAVEL_RETRY else STAGING_RETRY
+	if now - (self.travelAt or 0) < wait then
+		return false
+	end
+	self.travelAt = now
+	if staging then
+		-- Only a fired remote counts against the attempt limit; walks do not.
+		self.travelTries = (self.travelTries or 0) + 1
+	end
+	if self.travelWarned ~= true then
+		self.travelWarned = true
+		self.notify("不在万圣节健身房：先传送到集结点，再触发区域传送", "info")
+	end
+	Boss.requestTravel(self)
+	return false
+end
+
+--[[
 	Get onto the boss, properly.
 
 	The old shape of this was ONLY a motion hold: `motion:setTarget(pos)` plus
@@ -10252,12 +10657,11 @@ end
 	    approach), `motion:begin` was never called at all, so the boss task did
 	    nothing but observe.
 
-	This drives the teleport directly and keeps the hold only as the anti-pull
-	correction once we are actually near. The re-approach is rate limited: a boss
-	that is alive but unreachable must not be re-teleported to every frame.
+	The fix is the PIN: the hold is armed on the first tick (see Boss.approach) and
+	`Motion.apply` then writes the hover position every RenderStepped -- about
+	0.016 s, tighter than the 0.025 s the user asked for -- wherever the boss moves
+	to. No walk, no approach interval, no arrival distance.
 ]]
-local APPROACH_INTERVAL = 0.5
-local ARRIVE_DISTANCE = 12
 --[[
 	Hover height above the boss: close enough for the punches to land, high enough
 	that the boss's own attacks mostly miss.
@@ -10315,31 +10719,61 @@ function Boss.approach(self, now)
 	-- near where they came in rather than stranded above an empty arena.
 	self.lastPosition = position
 
-	-- Hover height: close enough for the punches to land, high enough that the
-	-- boss's own attacks mostly miss.
-	local destination = info.position + Vector3.new(0, hoverHeight(self.store, info), 0)
-	local distance = (position - destination).Magnitude
+	--[[
+		EVENT BOSSES ARE ONLY FOUGHT FROM INSIDE THE HALLOWED GYM.
 
-	if distance > ARRIVE_DISTANCE and self.teleport ~= nil then
-		if now - (self.approachAt or 0) >= APPROACH_INTERVAL then
-			self.approachAt = now
-			-- hold = false while travelling: the walk owns the character for the
-			-- duration, and the hold begins on arrival (see Teleport._arrive).
-			self.teleport:walk(destination, { mode = "boss", hold = false, arc = 120 })
-		end
+		See Boss.ensureArena: from outside, the fight asks the game's own area
+		travel remote to move us there and stands down until it lands.
+	]]
+	if info.group == BossInfo.EVENT_GROUP and not Boss.ensureArena(self, now, info, position) then
 		return
 	end
 
-	--[[
-		In range: keep the position with the motion hold so a server pull-back is
-		corrected rather than leaving the player on the ground.
+	-- Hover height: close enough for the punches to land, high enough that the
+	-- boss's own attacks mostly miss.
+	local destination = info.position + Vector3.new(0, hoverHeight(self.store, info), 0)
 
-		And FACE the boss, tilted down. Without this the hold wrote a CFrame with
-		no rotation at all, so the character hovered above the boss staring
-		straight ahead and the punches went nowhere near it -- the reference
-		script's `CFrame.lookAt(hoverPos, hoverPos + (flat.Unit +
-		Vector3.new(0,-1,0)).Unit)` is exactly the missing half.
+	--[[
+		PIN THE BODY ON THE BOSS -- NOW, EVERY FRAME.
+
+		Was: stage a walk there while farther than 12 studs, and only start the
+		hold on arrival. Two problems, both reported:
+
+		  * "贴在 boss 身上的那个传送太慢了" -- the walk had a half-second time
+		    budget and was re-issued only every 0.5 s, so getting onto a distant
+		    boss took a second or more;
+		  * if a hold was already active for something else (a chest, a teleport),
+		    `motion:begin` never ran and the boss task only watched.
+
+		The user's number is 0.025 s between writes. The motion hold already
+		re-writes the CFrame on RenderStepped (~0.016 s), so the fix is to start
+		that hold IMMEDIATELY instead of walking first: `setTarget` re-aims an
+		active hold, and the pin then follows the boss wherever it moves.
 	]]
+	self.approachAt = now
+	if self.teleport ~= nil and Teleport.isBusy(self.teleport) then
+		-- A staged walk in flight would fight the pin (and be cancelled by it).
+		Teleport.cancel(self.teleport)
+	end
+
+	--[[
+		THE PIN, AT 0.025 s, WITH THE FACING.
+
+		The user's exact requirement: "0.025 秒传送一次，并且同时设置面朝向".
+		This is a direct CFrame write (position + downward-tilted look) issued from
+		the tick, so it does not depend on the hold's verify/retry bookkeeping --
+		which is what still made the hover feel like "0.5 秒一次" whenever a sample
+		or a retry was pending.
+
+		The hold is armed as well, so between pins the character is still corrected
+		every frame; both write the same pose.
+	]]
+	if self.teleport ~= nil and self.store:get("boss.directPin") ~= false
+		and now - (self.pinAt or 0) >= PIN_INTERVAL then
+		self.pinAt = now
+		self.teleport:pin(destination, info.position, lookBias(self.store))
+	end
+
 	self.motion:setTarget(destination)
 	if not self.motion:isActive() then
 		self.motion:begin({
@@ -10349,6 +10783,13 @@ function Boss.approach(self, now)
 			lookBias = lookBias(self.store),
 		})
 	end
+	--[[
+		FACE the boss, tilted down. Without this the hold wrote a CFrame with no
+		rotation at all, so the character hovered above the boss staring straight
+		ahead and the punches went nowhere near it -- the reference script's
+		`CFrame.lookAt(hoverPos, hoverPos + (flat.Unit + Vector3.new(0,-1,0)).Unit)`
+		is exactly the missing half.
+	]]
 	self.motion:setLook(info.position, lookBias(self.store))
 end
 
@@ -10487,10 +10928,26 @@ function Boss.chestTick(self, now)
 	end
 	local stand = position + Vector3.new(0, CHEST_STAND_HEIGHT, 0)
 
+	--[[
+		FALLING SHORT OF THE CHEST COUNTS AS "NOT THERE YET".
+
+		The reported bug: "有的时候会掉到虚空，漏开宝箱". The chest walk lands the
+		player above the rig, the verification hold releases, and anything that
+		puts the character BELOW that point (the arena's own pull, a missed hop
+		over a pit, the void under a stadium) left the task hammering E from a
+		position the prompt could not reach -- with `nearby` still true, because
+		"nearby" only compared the HELD position to the chest.
+
+		A large downward error is now a failed approach: re-walk, and keep trying
+		until the chest window closes.
+	]]
+	local fell = origin ~= nil and (origin.Y < stand.Y - 40 or origin.Y < -50)
+
 	local current = self.motion:targetPosition()
 	local nearby = self.motion:isActive()
 		and typeof(current) == "Vector3"
 		and (current - stand).Magnitude <= 5
+		and not fell
 	if not nearby then
 		--[[
 			STAND ~15 STUDS ABOVE THE CHEST'S BASE PART.
@@ -10502,7 +10959,10 @@ function Boss.chestTick(self, now)
 			within prompt range in game (the legacy value of 5 put them at the
 			hinge line, where the E key often did nothing).
 		]]
-		self.teleport:walk(position + Vector3.new(0, CHEST_STAND_HEIGHT, 0), { mode = "chest", arc = 120 })
+		self.teleport:walk(stand, { mode = "chest", arc = 120 })
+		-- Re-walking owns the character; interacting from here would fire at a
+		-- prompt the player is not in range of yet.
+		return
 	end
 
 	-- Once every 0.4s. Interaction is not rate limited on the wire, but clicking
@@ -10658,6 +11118,9 @@ function Boss.eventStatus(self): string
 	if aliveCount > 0 then
 		local info = Boss.detectEvent(self)
 		local label = if info ~= nil then info.id else "?"
+		if not inHallowedGym() and (self.travelTries or 0) > 0 then
+			return string.format("活动 Boss：正在前往万圣节健身房（目标 %s）", label)
+		end
 		return string.format("活动 Boss：%d/%d 存活 · 正在打 %s", aliveCount, wanted, label)
 	end
 	if self.eventSeen == true then
@@ -11091,13 +11554,14 @@ __modules["game/Machine"] = function()
 --[[
 	Machine -- sitting on a gym machine.
 
-	The two decisions live in core and are tested there:
-	    core/MachinePlan  which machine to use
-	    core/MountState   when to hover, when to sit, when to give up
+	WHICH machine is a pure decision and lives in core/MachinePlan (tested there).
+	Everything else -- finding the seat, putting the body on it, asking the game --
+	is here, and it is now DIRECT rather than state-machine paced: the reported
+	faults were "延迟非常高 / 等个几十秒" and "干脆不上", and both were pacing
+	bugs rather than traversal bugs (see the constants below and Machine.tick).
 
-	What is left here is the object traversal and the engine calls: reading the
-	machines folder, resolving a seat, and performing the "aim" / "sit" /
-	"release" actions the state machine asks for.
+	core/MountState is no longer used by this file. It stays in core (and in the
+	unit tests) as the documented model of the legacy 0.8 s-hover cadence.
 
 	One robustness fix over V1007: the seat is read through occupantOf, which only
 	touches `Occupant` on an actual Seat or VehicleSeat. The original read
@@ -11110,17 +11574,29 @@ __modules["game/Machine"] = function()
 local VirtualInputManager = game:GetService("VirtualInputManager")
 
 local MachinePlan = require("core/MachinePlan")
-local MountState = require("core/MountState")
-local GameNet = require("game/Net")
 local Remotes = require("game/Remotes")
 
 local Machine = {}
 Machine.__index = Machine
 
 local SCAN_CACHE = 2
-local HOVER_HEIGHT = 3
+-- Kept because `Machine.aim` is still the documented hover pose; the sit path now
+-- uses SIT_HEIGHT.
 local SIT_HEIGHT = 1.2
 local KEY_TAIL = 0.05
+--[[
+	THE PACING, which is the whole point of this revision.
+
+	Was: MountState's 0.8 s hover, a 0.35 s retry gate on every action, and a 3 s
+	per-seat timeout -- i.e. more than a second of doing nothing before the first
+	attempt, then a retry the player perceives as "延迟非常高…等个几十秒".
+
+	Now: re-assert the position 6-7x a second, ask the game 3x a second, and give
+	up on a single stubborn seat after 4 s so the next one is tried.
+]]
+local SIT_INTERVAL = 0.15
+local SEND_INTERVAL = 0.3
+local SEAT_TIMEOUT = 4
 
 -- Reading `Occupant` on a non-seat part errors, so it is only read where it is
 -- actually a property.
@@ -11151,6 +11627,9 @@ function Machine.new(context)
 		scheduler = context.scheduler,
 		timers = context.timers,
 		character = context.character,
+		-- Used to put the body on the seat in one frame (Teleport.snap), and to
+		-- clear a stale motion hold that would drag it back off.
+		teleport = context.teleport or nil,
 		isCombatBusy = context.isCombatBusy or function()
 			return false
 		end,
@@ -11172,12 +11651,14 @@ function Machine.new(context)
 			return false
 		end,
 		notify = context.notify or function() end,
-		mount = MountState.new(),
 		cache = {},
 		cacheAt = 0,
 		target = nil,
 		attempts = 0,
 		lastPhase = "idle",
+		placeAt = nil,
+		sendAt = nil,
+		seatSince = nil,
 	}, Machine)
 	return self
 end
@@ -11201,14 +11682,26 @@ function Machine.seats(self, force)
 	if folder ~= nil then
 		for index, model in ipairs(folder:GetChildren()) do
 			if model:IsA("Model") then
-				local seat = model:FindFirstChild("interactSeat")
+				--[[
+					`interactSeat` IS FOUND RECURSIVELY.
+
+					This was `FindFirstChild("interactSeat")` -- one level only --
+					while the live machines nest it deeper (the reference
+					implementation this feature was checked against uses
+					`FindFirstChild("interactSeat", true)`). With the non-recursive
+					lookup most machines produced no seat at all, so `seats()` came
+					back empty, `resolve()` returned nil and the whole feature did
+					nothing -- the reported "使用器械的功能依旧无效".
+				]]
+				local seat = model:FindFirstChild("interactSeat", true)
 				if seat == nil or not seat:IsA("BasePart") then
 					seat = nil
-					for _, child in ipairs(model:GetChildren()) do
-						if child:IsA("Seat") or child:IsA("VehicleSeat") then
-							seat = child
-							break
-						end
+					local found = model:FindFirstChildWhichIsA("Seat", true)
+					if found == nil then
+						found = model:FindFirstChildWhichIsA("VehicleSeat", true)
+					end
+					if found ~= nil then
+						seat = found
 					end
 				end
 				if seat ~= nil and seat:IsA("BasePart") then
@@ -11261,10 +11754,24 @@ end
 	the player parked on a machine while auto-boss punched nothing.
 ]]
 function Machine.blocked(self): boolean
+	local blocked = Machine.blockedState(self)
+	return blocked
+end
+
+-- The same answer, WITH THE REASON, so the page can say why nothing is moving.
+-- "明明启用了器械却不上" is unanswerable otherwise: a blocked machine and a
+-- machine with no target look identical from outside.
+function Machine.blockedState(self): (boolean, string?)
 	if self.isDamageNeeded() then
-		return true
+		return true, "有击杀/Boss 任务需要出拳"
 	end
-	return self.isCombatBusy() or self.isBossAlive()
+	if self.isCombatBusy() then
+		return true, "杀戮进行中"
+	end
+	if self.isBossAlive() then
+		return true, "Boss 存活中"
+	end
+	return false, nil
 end
 
 function Machine.dismount(self)
@@ -11282,37 +11789,84 @@ function Machine.dismount(self)
 			root.Anchored = false
 		end)
 	end
-	self.mount:reset()
 	self.target = nil
+	self.seatSince = nil
+	self.placeAt = nil
+	self.sendAt = nil
 	self.lastPhase = "idle"
 end
 
-local function aim(self, root, seat)
-	local ok, position = pcall(function()
-		return seat.Position
-	end)
-	if not ok then
-		return
+--[[
+	USE THE MACHINE, NOW.
+
+	Two things were wrong with the old path.
+
+	1. IT WENT THROUGH A RATE-LIMITED CHANNEL. `machineInteractRemote` was sent
+	   on a channel with `rate = 4, burst = 2, queue = 8`, and the mount state
+	   machine retried every 0.35 s -- so the queue filled with duplicate
+	   "useMachine" calls that then drained at four a second. That is the reported
+	   "延迟非常高…等个几十秒他才去使用器械": the player was waiting for his own
+	   queue.
+
+	2. `InvokeServer` YIELDS. The game's remote is a RemoteFunction, and this runs
+	   inside a scheduler tick on the Heartbeat callback, so invoking it inline
+	   would stall the whole frame loop for a network round trip. It runs in a
+	   task.spawn, exactly like the area-travel call.
+
+	The channel is gone: a one-shot interaction has nothing to throttle, and the
+	caller already paces itself.
+]]
+function Machine.use(self, seat): boolean
+	local remote = Remotes.machine()
+	if remote == nil then
+		return false
 	end
-	pcall(function()
-		root.Anchored = true
-		root.CFrame = CFrame.new(position + Vector3.new(0, HOVER_HEIGHT, 0))
-		root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-		root.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+	task.spawn(function()
+		pcall(function()
+			if remote:IsA("RemoteFunction") then
+				remote:InvokeServer("useMachine", seat)
+			else
+				remote:FireServer("useMachine", seat)
+			end
+		end)
 	end)
+	return true
 end
 
-local function sit(self, root, humanoid, seat)
+--[[
+	Put the body ON the seat and sit, immediately.
+
+	`Anchored` is cleared FIRST, and that is not cosmetic: `aim` anchors the root
+	while hovering, and a Roblox character cannot sit while its root is anchored,
+	so every `seat:Sit` was silently undone by the anchor and the state machine
+	retried until it timed out -- the other half of "要么干脆不上".
+]]
+local function mountSeat(self, root, humanoid, seat, now)
 	local ok, position = pcall(function()
 		return seat.Position
 	end)
-	if ok then
-		pcall(function()
-			root.CFrame = CFrame.new(position + Vector3.new(0, SIT_HEIGHT, 0))
-		end)
-	end
 
-	self.net:send("machine", os.clock(), "useMachine", seat)
+	if self.teleport ~= nil and ok and typeof(position) == "Vector3" then
+		-- Clears any stale motion hold too (snap calls motion:finish), which
+		-- would otherwise drag the character back off the seat every frame.
+		self.teleport:snap(position + Vector3.new(0, SIT_HEIGHT, 0))
+	else
+		pcall(function()
+			root.Anchored = false
+		end)
+		if ok and typeof(position) == "Vector3" then
+			pcall(function()
+				root.CFrame = CFrame.new(position + Vector3.new(0, SIT_HEIGHT, 0))
+			end)
+		end
+	end
+	pcall(function()
+		root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+	end)
+	pcall(function()
+		root.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+	end)
+
 	pcall(function()
 		seat:Sit(humanoid)
 	end)
@@ -11325,73 +11879,109 @@ local function sit(self, root, humanoid, seat)
 	-- 0.05s here, and a blocked task cannot be cancelled on unload.
 	if type(firetouchinterest) == "function" then
 		pcall(firetouchinterest, seat, root, 0)
-		self.timers:after(os.clock(), KEY_TAIL, function()
+		self.timers:after(now, KEY_TAIL, function()
 			pcall(firetouchinterest, seat, root, 1)
 		end)
 	end
-	self.attempts += 1
 end
 
 function Machine.tick(self, now)
-	local store = self.store
 	local humanoid = self.character:humanoid()
 	local root = self.character:requireRoot()
 	local hasCharacter = humanoid ~= nil and root ~= nil
 
-	if self.target ~= nil and self.target.Parent == nil then
-		self.target = nil
+	--[[
+		`self.target` IS A SEAT RECORD ({ model, seat, name, gym, index }), NOT A
+		SEAT PART.
+
+		This tick used to read `self.target.Parent`, `occupantOf(self.target)` and
+		`self.target.Parent == nil` as if it were the part -- so the record was
+		discarded on the very first line, and `targetValid` was ALWAYS false
+		because a plain table has no `.Parent`. `MountState` then refused to act
+		for the rest of the session: "明明启用了器械，就是不上". The record is now
+		unpacked once and used properly.
+	]]
+	if self.target ~= nil then
+		local model = self.target.model
+		local seat = self.target.seat
+		if model == nil or model.Parent == nil or seat == nil or seat.Parent == nil then
+			self.target = nil
+		end
 	end
 	if hasCharacter and self.target == nil then
 		self.target = Machine.resolve(self)
+		self.attempts = 0
+		self.placeAt = nil
+		self.sendAt = nil
 	end
 
-	local seat = self.target
+	local target = self.target
+	if not hasCharacter or target == nil then
+		return
+	end
+
+	local seat = target.seat
 	local occupant = occupantOf(seat)
-	local seated = hasCharacter and seat ~= nil and (humanoid.Sit == true or occupant == humanoid)
-	local targetValid = seat ~= nil and seat.Parent ~= nil and (occupant == nil or occupant == humanoid)
 
-	local result = self.mount:step({
-		enabled = store:get("machine.enabled") == true,
-		blocked = Machine.blocked(self),
-		training = store:get("train.auto") == true or store:get("train.fast") == true,
-		hasCharacter = hasCharacter,
-		targetValid = targetValid,
-		seated = seated,
-	}, now)
-
-	if result.timedOut then
-		-- The seat is not cooperating; try a different one next time.
+	-- Somebody else took it (or we are the occupant): hands off, pick again.
+	if occupant ~= nil and occupant ~= humanoid then
 		self.target = nil
+		return
 	end
 
-	if result.action == "release" then
-		Machine.dismount(self)
-		return result
-	end
+	--[[
+		SEATED: STOP PUSHING.
 
-	if hasCharacter then
-		if result.action == "aim" and seat ~= nil then
-			aim(self, root, seat)
-		elseif result.action == "sit" and seat ~= nil then
-			sit(self, root, humanoid, seat)
-		elseif result.phase == "mounted" and root.Anchored then
-			-- Attached: give the seat control of the body.
+		Continuing to rewrite the CFrame here would fight the seat's own weld and
+		throw the player off it.
+	]]
+	if humanoid.Sit == true or occupant == humanoid then
+		if root.Anchored then
 			pcall(function()
 				root.Anchored = false
 			end)
 		end
+		self.lastPhase = "mounted"
+		return
 	end
 
-	self.lastPhase = result.phase
-	return result
+	self.lastPhase = "mounting"
+
+	--[[
+		THE PACING IS NOW "AS FAST AS USEFUL", not a 0.8 s hover plus a 0.35 s
+		retry gate. Position is re-asserted every SIT_INTERVAL and the remote every
+		SEND_INTERVAL, and a seat that will not take the player is abandoned after
+		SEAT_TIMEOUT so a broken one cannot wedge the feature for a minute.
+	]]
+	local startedAt = self.seatSince or now
+	self.seatSince = startedAt
+	if now - startedAt > SEAT_TIMEOUT then
+		self.target = nil
+		self.seatSince = nil
+		return
+	end
+
+	if now - (self.placeAt or 0) >= SIT_INTERVAL then
+		self.placeAt = now
+		mountSeat(self, root, humanoid, seat, now)
+	end
+
+	if now - (self.sendAt or 0) >= SEND_INTERVAL then
+		self.sendAt = now
+		self.attempts += 1
+		Machine.use(self, seat)
+	end
 end
 
 function Machine.stats(self)
+	local blocked, reason = Machine.blockedState(self)
 	return {
-		phase = self.mount.phase,
+		phase = self.lastPhase,
 		attempts = self.attempts,
-		target = if self.target ~= nil then self.target.Name else nil,
+		target = if self.target ~= nil then self.target.name else nil,
 		seats = #Machine.seats(self),
+		blocked = blocked,
+		reason = reason,
 	}
 end
 
@@ -11399,12 +11989,14 @@ function Machine.install(context)
 	local self = Machine.new(context)
 	local store = self.store
 
-	-- Sitting is a chained operation (hover, then interact, then touch), so the
-	-- channel queues rather than dropping.
-	self.net:addChannel("machine", GameNet.senderFor(function()
-		return Remotes.machine()
-	end), { rate = 4, burst = 2, queue = 8 })
+	--[[
+		NO `machine` CHANNEL ANY MORE.
 
+		It existed so the chained sit sequence could queue instead of dropping, but
+		it was ALSO the latency: rate = 4/s meant the interact call waited behind
+		duplicates the state machine kept adding. `Machine.use` fires the remote
+		directly now, and the tick paces it.
+	]]
 	self.scheduler:register({
 		id = "machine",
 		priority = 90,
@@ -12657,8 +13249,19 @@ local Lighting = game:GetService("Lighting")
 local Perf = {}
 Perf.__index = Perf
 
-local BUDGET_PER_TICK = 500
-local RESCAN_SECONDS = 45
+--[[
+	How much of the sweep runs per frame, and how long between sweeps.
+
+	Was 500 writes a tick every 45 s. Two things asked for a gentler number: a
+	sweep starts by building `Workspace:GetDescendants()` plus
+	`Lighting:GetDescendants()` (a large temporary array on a big place), and then
+	writes hundreds of properties. That is a real frame spike, and a spike is what
+	a client crash usually looks like from the outside -- so the sweep is spread
+	over more frames and repeated less often. The work is idempotent, so a slower
+	sweep costs nothing but a few seconds of latency.
+]]
+local BUDGET_PER_TICK = 250
+local RESCAN_SECONDS = 90
 
 -- Class -> the single property that switches it off, and the value to write.
 -- `true` means "record whatever it was and set it false"; `1` means
@@ -15187,19 +15790,30 @@ function Kit.dropdown(self, parent, spec)
 	self:track(backdrop.MouseButton1Click:Connect(closePanel))
 
 	--[[
-		Scroll or touch-drag dismisses the list.
+		SCROLLING THE LIST MUST NOT CLOSE IT.
 
-		V1007 closed on either, and it matters more here than it looks: the panel
-		is parented to the ScreenGui to escape the page's clipping, so scrolling
-		the page underneath while the list is open used to leave a floating panel
-		pinned over content that had scrolled away from its trigger.
+		The panel is parented to the ScreenGui to escape the page's clipping, so
+		something has to dismiss it when the page underneath scrolls -- otherwise
+		a floating panel stays pinned over content that scrolled away from its
+		trigger.
+
+		But the old rule closed on ANY wheel event reaching this frame, and a long
+		option list is scrolled BY WHEEL, so the list collapsed mid-scroll. The
+		previous fix compared `CanvasSize` against `AbsoluteSize`; with
+		`AutomaticCanvasSize` set, `CanvasSize` is not a reliable read on every
+		client, so it is computed from the CONTENT instead: the list is only
+		dismissed when there is nothing to scroll, i.e. when the wheel has nowhere
+		to go inside the panel. Touch is a drag ON the list, so it never dismisses.
 	]]
 	self:track(listFrame.InputChanged:Connect(function(input)
 		if not open then
 			return
 		end
-		if input.UserInputType == Enum.UserInputType.MouseWheel
-			or input.UserInputType == Enum.UserInputType.Touch then
+		if input.UserInputType ~= Enum.UserInputType.MouseWheel then
+			return
+		end
+		local content = (#values * (DROPDOWN_OPTION_HEIGHT + 2)) + 8
+		if content <= listFrame.AbsoluteSize.Y + 1 then
 			closePanel()
 		end
 	end))
@@ -18041,7 +18655,15 @@ local MIN_WIDTH = 240
 local MAX_WIDTH = 1200
 local MIN_HEIGHT = 160
 local MAX_HEIGHT = 1200
-local REFRESH_SECONDS = 0.2
+-- 0.2 s was 5 refreshes a second, each walking the leaderboard and formatting a
+-- dozen labels. 0.3 s is still visually instant and takes a third of that work
+-- out of the frame budget.
+local REFRESH_SECONDS = 0.3
+-- How far past the screen edge the panel may be pulled while dragging. Enough
+-- to feel like a rubber band, small enough that it never hides the title bar.
+local DRAG_OVER = 48
+-- Bounce time for the spring back (`InfoWindow.clampOnScreen`).
+local BOUNCE_SECONDS = 0.24
 
 local ROWS = {
 	{ key = "strength", label = "力量" },
@@ -18348,7 +18970,59 @@ function InfoWindow.build(self)
 		self.rows[spec.key] = value
 	end
 
-	-- Drag by the title bar.
+--[[
+	Apply the size the user just picked, IN PLACE.
+
+	The panel's own `Size` stays in unscaled units and `self.scale` (a UIScale) is
+	the only thing that carries `uiState.infoScale` -- so this writes the scale and
+	then re-clamps the panel onto the screen, because the frame's *rendered* size
+	just changed even though its `Size` property did not. Deliberately NOT
+	`place()`: that also re-runs the placement decision, which would slide the
+	panel sideways while the user is dragging the slider.
+]]
+function InfoWindow.applyScale(self)
+	if self.frame == nil or self.scale == nil then
+		return
+	end
+	local factor = (tonumber(self.store:get("uiState.infoScale")) or 100) / 100
+	self.scale.Scale = factor
+	InfoWindow.clampOnScreen(self, false)
+end
+
+--[[
+	Put the panel fully back on screen, and return where it landed.
+
+	"触边回弹": the drag may leave the panel a little past an edge; this is the
+	spring back. It returns the clamped coordinates rather than leaving the caller
+	to read `frame.Position`, because the bounce is a TWEEN -- reading the property
+	straight after starting it would persist the pre-bounce value.
+
+	The bar's height is kept visible at the top and left, so the drag handle can
+	never end up outside the screen.
+]]
+function InfoWindow.clampOnScreen(self, animate): (number, number)
+	if self.frame == nil then
+		return 0, 0
+	end
+	local screen = screenSize()
+	local size = self.frame.AbsoluteSize
+	local position = self.frame.Position
+	local maxX = math.max(0, screen.X - size.X)
+	local maxY = math.max(0, screen.Y - size.Y)
+	local x = math.clamp(position.X.Offset, 0, maxX)
+	local y = math.clamp(position.Y.Offset, 0, maxY)
+
+	if animate and (x ~= position.X.Offset or y ~= position.Y.Offset) then
+		self.kit:tween(self.frame, BOUNCE_SECONDS, {
+			Position = UDim2.fromOffset(x, y),
+		}, Enum.EasingStyle.Back)
+	else
+		self.frame.Position = UDim2.fromOffset(x, y)
+	end
+	return x, y
+end
+
+-- Drag by the title bar.
 	local dragging = false
 	local startInput = nil
 	local startPosition = nil
@@ -18372,8 +19046,25 @@ function InfoWindow.build(self)
 			and input.UserInputType ~= Enum.UserInputType.Touch then
 			return
 		end
+		--[[
+			RUBBER BAND AT THE EDGE ("触边回弹").
+
+			The panel used to follow the cursor anywhere, including off the
+			screen -- and its title bar is the ONLY drag handle, so dragging it
+			out of reach was unrecoverable without the reset button.
+
+			While dragging it may overshoot the edge by DRAG_OVER pixels (that is
+			the "pull" the user feels); on release `InfoWindow.clampOnScreen` springs
+			it back fully inside with a Back tween, which is the bounce.
+		]]
+		local screen = screenSize()
+		local size = frame.AbsoluteSize
+		local looseX = math.max(0, screen.X - size.X)
+		local looseY = math.max(0, screen.Y - size.Y)
 		local delta = input.Position - startInput
-		frame.Position = UDim2.fromOffset(startPosition.X.Offset + delta.X, startPosition.Y.Offset + delta.Y)
+		local x = math.clamp(startPosition.X.Offset + delta.X, -DRAG_OVER, looseX + DRAG_OVER)
+		local y = math.clamp(startPosition.Y.Offset + delta.Y, -DRAG_OVER, looseY + DRAG_OVER)
+		frame.Position = UDim2.fromOffset(x, y)
 	end))
 	kit:track(game:GetService("UserInputService").InputEnded:Connect(function(input)
 		if input.UserInputType ~= Enum.UserInputType.MouseButton1
@@ -18384,8 +19075,10 @@ function InfoWindow.build(self)
 			return
 		end
 		dragging = false
-		local position = frame.Position
-		self.store:set("uiState.savedInfo", { xs = 0, xo = position.X.Offset, ys = 0, yo = position.Y.Offset })
+		-- Bounce back INSIDE first, then persist what the bounce settled on (a
+		-- tween is asynchronous, so the saved value comes from the clamp itself).
+		local x, y = InfoWindow.clampOnScreen(self, true)
+		self.store:set("uiState.savedInfo", { xs = 0, xo = x, ys = 0, yo = y })
 	end))
 
 	kit:track(close.MouseButton1Click:Connect(function()
@@ -18486,6 +19179,26 @@ function InfoWindow.build(self)
 	end))
 
 	--[[
+		THE SIZE SLIDERS, which had NO listener at all.
+
+		`uiState.infoScale` was read in exactly one place -- inside `place()` --
+		and `place()` runs when the panel is shown, reset or re-anchored by an
+		animation. Changing the value therefore did nothing until the panel was
+		hidden and shown again, which is the reported "信息窗大小调节无效".
+
+		Both writers are covered: the settings slider (`infoScale`, a multiplier)
+		and the panel's own drag grip (`savedInfoSize`, a pixel size).
+	]]
+	kit:track(self.store:subscribe("uiState.infoScale", function()
+		InfoWindow.applyScale(self)
+	end))
+	kit:track(self.store:subscribe("uiState.savedInfoSize", function()
+		InfoWindow.loadBaseSize(self)
+		InfoWindow.applyBaseSize(self)
+		InfoWindow.clampOnScreen(self, false)
+	end))
+
+	--[[
 		Honour a visibility request that arrived BEFORE the frame existed.
 
 		main.luau subscribes to `uiState.infoVisible` and calls `show()` as soon as
@@ -18556,6 +19269,34 @@ end
 	the main window is not collapsed. Writing the user's intent over the top of a
 	collapse would reopen the panel on top of a minimised window.
 ]]
+--[[
+	Put the panel back in its default spot, and PERSIST THAT SPOT.
+
+	The reported bug: "重置位置实时信息窗口它位置会乱跳". `Shell.resetLayout` wrote
+	`uiState.savedInfo = { xs = 0.5, xo = 0, ys = 0.5, yo = 0 }` -- a SCALE-based
+	centre -- while this panel always stores ABSOLUTE offsets. `place()` then read
+	the centre as a preferred position, PanelPlacement moved the panel off the main
+	window, the panel's own next save rewrote the value in the other shape, and the
+	next reset moved it somewhere else again. Two writers, two coordinate shapes.
+
+	So the panel owns its own reset: one shape (absolute), one place (the same
+	default `place()` falls back to), written and applied here.
+]]
+function InfoWindow.resetPlacement(self)
+	InfoWindow.loadBaseSize(self)
+	InfoWindow.applyBaseSize(self)
+
+	local screen = screenSize()
+	local height = if self.minimized then MINIMIZED_HEIGHT else self.baseHeight
+	self.store:set("uiState.savedInfo", {
+		xs = 0,
+		xo = math.max(0, math.floor(screen.X - self.baseWidth - 40)),
+		ys = 0,
+		yo = math.max(0, math.floor(screen.Y - height - 40)),
+	})
+	InfoWindow.place(self)
+end
+
 function InfoWindow.applyVisibility(self)
 	if self.frame == nil then
 		return
@@ -19436,37 +20177,44 @@ Page.build = function(kit, page, shell)
 	kit:toggle(machines, {
 		label = "启用器械",
 		path = "machine.enabled",
-		hint = "需要先开启自动或快速锻炼",
+		hint = "随时可用，不依赖自动锻炼",
 	})
 
 	--[[
-		"启用器械" refuses to turn on unless training is already on.
+		MACHINES DO NOT NEED TRAINING SWITCHED ON.
 
-		V1007 did this with a notify ("请先开启自动锻炼") and flipped the toggle
-		back. Without it, turning the machine on first does nothing visible: the
-		mount state machine is gated on training as well (`Machine.tick` passes
-		`train.auto or train.fast` into MountState), so the user gets an enabled
-		switch, no movement, and nothing explaining why.
-
-		Written as a store subscription rather than an onChange so that EVERY
-		writer is covered -- the toggle, a loaded config, a config slot, or a
-		future keybind. The subscribe callback runs after the value is stored, so
-		the write-back below is what actually keeps the state consistent.
+		The old build refused to enable the machine unless auto/fast training was
+		already on (a toast, then the switch flipped itself back), because the
+		mount state machine was gated on training too. The user's own words are
+		"这个功能其实是什么时候都可以打开的", so both halves of that gate are
+		gone: the switch just switches, and `Machine.tick` no longer passes the
+		training flags into MountState.
 	]]
-	kit:track(kit.store:subscribe("machine.enabled", function(_, value)
-		if value ~= true then
-			return
-		end
-		if kit.store:get("train.auto") == true or kit.store:get("train.fast") == true then
-			return
-		end
-		shell:toast("请先开启自动锻炼或快速锻炼", "warn")
-		kit.store:set("machine.enabled", false)
-	end))
 
+	-- Forward-declared because the gym dropdown (below) re-classifies the machine
+	-- list, and that list's widgets do not exist yet. It is only ever CALLED after
+	-- they do -- the same pattern the config-slot page uses.
+	local refreshMachines
+
+	--[[
+		EVERY GYM, not just the ones with streamed-in machines.
+
+		The picker used to be built from `machineService:seats()`, so the only
+		choice was 全部 unless the player happened to be standing in a gym at that
+		moment -- the reported "我没法选择具体是哪个健身房". The list is now the static
+		gym table (which includes the seasonal gym) plus anything the live scan
+		found that the table does not know yet, so the gyms are a real CATEGORY.
+	]]
 	local function gymOptions()
 		local seen = { ["全部"] = true }
 		local out = { "全部" }
+		for _, gym in ipairs(MachinePlan.gyms()) do
+			local label = MachinePlan.gymLabel(gym.name)
+			if seen[label] ~= true then
+				seen[label] = true
+				table.insert(out, label)
+			end
+		end
 		if machineService ~= nil then
 			for _, seat in ipairs(machineService:seats()) do
 				local label = MachinePlan.gymLabel(seat.gym)
@@ -19486,6 +20234,15 @@ Page.build = function(kit, page, shell)
 			return a < b
 		end)
 		return out
+	end
+
+	-- The seats of the SELECTED gym, which is what makes the name and index
+	-- lists follow the gym category rather than the whole world.
+	local function seatsForGym()
+		if machineService == nil then
+			return {}
+		end
+		return MachinePlan.byGym(machineService:seats(), kit.store:get("machine.gymFilter"))
 	end
 
 	kit:dropdown(machines, {
@@ -19512,6 +20269,10 @@ Page.build = function(kit, page, shell)
 				return MachinePlan.gymLabel(stored)
 			end,
 		},
+		onSelect = function()
+			-- Choosing a gym re-classifies the machine list underneath it.
+			refreshMachines(false)
+		end,
 	})
 
 	local nameDropdown
@@ -19526,21 +20287,23 @@ Page.build = function(kit, page, shell)
 		old version look like it worked: it "refreshed" by overwriting whatever
 		the user had picked with 全部.
 	]]
-	local function refreshMachines(resetSelection)
+	local function refreshMachinesImpl(resetSelection)
 		if nameDropdown == nil or indexDropdown == nil or machineService == nil then
 			return
 		end
 
-		local known = machineService:names()
+		-- Names OF THE SELECTED GYM: the gym filter is a category, and the list
+		-- under it has to belong to that category.
+		local seats = seatsForGym()
 		local names = { "全部" }
-		for _, name in ipairs(known) do
+		for _, name in ipairs(MachinePlan.names(seats)) do
 			table.insert(names, MachinePlan.machineLabel(name))
 		end
 		local resetName = if resetSelection then "全部" else nil
 		nameDropdown.refresh(names, resetName)
 
 		local stored = kit.store:get("machine.nameFilter")
-		local count = machineService:count(stored)
+		local count = MachinePlan.count(seats, stored)
 		local indexes = { "随机" }
 		for position = 1, math.max(1, count) do
 			table.insert(indexes, "第" .. position .. "台")
@@ -19548,13 +20311,12 @@ Page.build = function(kit, page, shell)
 		local resetIndex = if resetSelection then "随机" else nil
 		indexDropdown.refresh(indexes, resetIndex)
 	end
+	refreshMachines = refreshMachinesImpl
 
 	local function nameOptions()
 		local out = { "全部" }
-		if machineService ~= nil then
-			for _, name in ipairs(machineService:names()) do
-				table.insert(out, MachinePlan.machineLabel(name))
-			end
+		for _, name in ipairs(MachinePlan.names(seatsForGym())) do
+			table.insert(out, MachinePlan.machineLabel(name))
 		end
 		return out
 	end
@@ -19569,7 +20331,7 @@ Page.build = function(kit, page, shell)
 				if display == "全部" then
 					return ""
 				end
-				local known = if machineService ~= nil then machineService:names() else {}
+				local known = MachinePlan.names(seatsForGym())
 				for _, name in ipairs(known) do
 					if MachinePlan.machineLabel(name) == display then
 						return name
@@ -19635,8 +20397,37 @@ Page.build = function(kit, page, shell)
 		end)
 	end
 
+	kit:note(machines, "健身房是分类：选了健身房，下面的器械名和编号只列那个健身房的")
 	kit:note(machines, "多人同器械时会自动换一台空闲的；列表每 6 秒重新扫描一次")
 	refreshMachines(true)
+
+	--[[
+		A STATUS LINE FOR THE MACHINE, because "使用器械无效" is otherwise
+		unanswerable: the phase says whether it is hovering, sitting or blocked,
+		and the seat count says whether the scan found anything at all (an empty
+		count is the difference between "the feature is off" and "the machines are
+		not where this build expects them").
+	]]
+	local machineStatus = kit:instance("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 20),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamMedium,
+		Text = "器械状态：-",
+		TextColor3 = kit:color("TextSecond"),
+		TextSize = 12,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		LayoutOrder = kit:nextOrder(machines),
+	}, machines)
+	shell:addUiTick(function()
+		if machineService == nil then
+			return
+		end
+		local stats = machineService:stats()
+		machineStatus.Text = string.format(
+			"器械状态：%s · 目标 %s · 扫描到 %d 台 · 尝试 %d 次",
+			tostring(stats.phase), tostring(stats.target or "无"), stats.seats, stats.attempts
+		)
+	end)
 
 	kit:section(page, "锻炼时机")
 	local timing = kit:card(page)
@@ -20208,6 +20999,15 @@ Page.build = function(kit, page, shell)
 		path = "kill.lookDown",
 		hint = "关闭则平视目标，拳头容易从头顶飞过；打 Boss 也用这个开关",
 	})
+	--[[
+		打人的 0.025 秒直写：和打 Boss 是两个独立开关 + 两个独立计时器（目标不同、
+		位置刷新节奏不同，共用一个计时器会互相饿死）。
+	]]
+	kit:toggle(approach, {
+		label = "贴脸直写 0.025 秒（位置+朝向）",
+		path = "kill.directPin",
+		hint = "关闭后只用每帧的保持修正；打不到人时可以先关掉试试",
+	})
 
 	kit:section(page, "单独击杀")
 	local single = kit:card(page)
@@ -20546,6 +21346,18 @@ Page.build = function(kit, page, shell)
 		},
 	})
 	kit:note(auto, "两组只影响谁先打；打完一组后会自动接着打另一组")
+	--[[
+		THE 0.025 s DIRECT PIN.
+		On by default (the user's requirement), and switchable because it is the
+		one thing to turn off if a place reacts badly to 40 pose writes a second.
+		The kill feature has its OWN equivalent switch -- different target,
+		different timer.
+	]]
+	kit:toggle(auto, {
+		label = "贴脸直写 0.025 秒（位置+朝向）",
+		path = "boss.directPin",
+		hint = "关闭后只用每帧的保持修正；打不到 Boss 时可以先关掉试试",
+	})
 
 	local statusBox = kit:instance("Frame", {
 		Size = UDim2.new(1, 0, 0, 52),
@@ -20631,6 +21443,7 @@ Page.build = function(kit, page, shell)
 		table.insert(heights, string.format("%s %d", entry.label:match("^%S+"), entry.hover))
 	end
 	kit:note(eventCard, "悬停高度固定：" .. table.concat(heights, " · ") .. " 格")
+	kit:note(eventCard, "不在万圣节健身房时，会先用游戏自己的 areaTravelRemote 传送过去，再开始打")
 
 	-- ------------------------------------------------------------ the hop --
 	kit:section(page, "活动 Boss 清空后换服")
@@ -22224,7 +23037,7 @@ function Main.start()
 			which is what makes "below -50" a reliable definition of "out of the
 			world": the saved point can never itself be out there.
 		]]
-		runtime.timers:every(os.clock(), 2, function()
+		runtime.timers:every(os.clock(), 1, function()
 			local root = character:requireRoot()
 			if root == nil then
 				return
@@ -22235,15 +23048,40 @@ function Main.start()
 			if not ok or typeof(position) ~= "Vector3" or position.Y >= -50 then
 				return
 			end
-			-- Never fight an in-flight teleport: `Teleport:walk` cancels its own
-			-- predecessor, so a rescue dispatched here would silently replace the
-			-- walk the user (or a subsystem) just started.
-			if teleport:isBusy() then
-				return
+
+			--[[
+				THE RESCUE MUST NOT BE STARVED, and it must work more than once.
+
+				Two defects, both reported as "掉虚空自动拉回永远只能触发一次":
+
+				  * it returned early whenever ANY walk was in flight. The chest
+				    task and the boss pin both keep walks going, so in practice the
+				    rescue usually found `isBusy()` true and never fired at all --
+				    and after the one time it did fire, the walk it started made
+				    `isBusy()` true again for as long as the character kept
+				    falling. A character in the void outranks a pending walk, so
+				    the walk is CANCELLED rather than waited for.
+				  * when no safe point had been recorded yet (`markSafe` refuses
+				    while a hold is active, and a boss fight holds almost
+				    continuously) there was nothing to fall back to and the rescue
+				    simply gave up. The Hallowed Gym / lobby coordinate is a
+				    destination that always exists.
+
+				The 1-second cadence and the explicit cancel also mean the rescue
+				re-arms itself every second instead of depending on a state that
+				the rescue's own walk happens to set.
+			]]
+			if teleport ~= nil then
+				pcall(function()
+					teleport:cancel()
+				end)
 			end
 			local safe = motion:safePosition()
 			if safe == nil then
-				return
+				-- 万圣节健身房 as the last resort: it is where the seasonal bosses
+				-- are, so a player pulled out of the void lands somewhere usable
+				-- rather than at whatever stale coordinate was left over.
+				safe = Vector3.new(5505.53, 96.32, 5893.50)
 			end
 			warn("[MKUltraHUB][motion] 掉出地图，已送回安全点")
 			teleport:walk(safe + Vector3.new(0, 5, 0), { mode = "tp", hold = false })
@@ -22318,6 +23156,8 @@ function Main.start()
 			scheduler = runtime.scheduler,
 			character = character,
 			motion = motion,
+			-- The 0.025 s pin for player targets (independent timer from the boss's).
+			teleport = teleport,
 			net = net,
 			arbiter = arbiter,
 			pets = pets,
@@ -22331,6 +23171,9 @@ function Main.start()
 			scheduler = runtime.scheduler,
 			timers = runtime.timers,
 			character = character,
+			-- One-frame placement on the seat (`Teleport.snap`), so the machine
+			-- mount does not have to hover its way over.
+			teleport = teleport,
 			isCombatBusy = function()
 				return Combat.isBusy(combat)
 			end,
@@ -22531,15 +23374,15 @@ function Main.start()
 		end
 
 		-- The reset button is the recovery path, so it has to repair the info
-		-- panel too: its scale, its saved position and its saved size are store
-		-- keys the Shell writes but does not own.
+		-- panel too. It delegates to the PANEL, which is the only thing that knows
+		-- the coordinate shape it stores (see InfoWindow.resetPlacement): the
+		-- shell used to write a scale-based position here, and mixing the two
+		-- shapes is exactly what made the panel "位置乱跳" on every reset.
 		shell.onReset = function()
 			if infoWindow == nil then
 				return
 			end
-			InfoWindow.loadBaseSize(infoWindow)
-			InfoWindow.applyBaseSize(infoWindow)
-			InfoWindow.place(infoWindow)
+			InfoWindow.resetPlacement(infoWindow)
 		end
 
 		--[[
