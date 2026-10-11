@@ -2,8 +2,8 @@
 -- ===========================================================================
 --  MKUltraHUB -- GENERATED BUNDLE. DO NOT EDIT.
 --  Source of truth: src\**\*.luau   Builder: tools\bundle.ps1
---  Modules: 71   Entry: main
---  Generated: 2026-10-11 13:10:15
+--  Modules: 74   Entry: main
+--  Generated: 2026-10-11 16:48:55
 -- ===========================================================================
 
 local __modules = {}
@@ -1024,7 +1024,7 @@ local BossInfo = require("core/BossInfo")
 
 local Config = {}
 
-Config.VERSION = 1008
+Config.VERSION = 1009
 
 export type Spec = {
 	path: string,
@@ -1086,6 +1086,22 @@ end
 
 local function preset(path: string): Spec
 	return { path = path, kind = "preset", default = {} }
+end
+
+--[[
+	A MAP: `{ [name] = boolean }`, or `{ [name] = { [name] = boolean } }` at most
+	one level deep.
+
+	Added for the crystal auto-sell list, which is per CRYSTAL ("让我来选择出售
+	哪些宠物，就是该水晶的哪些宠物"): the selection has to survive a crystal
+	change and a reload, and `preset` (a flat array of {name,count}) cannot express
+	"which crystal this name belongs to".
+
+	Like `preset` and `position`, it is a LEAF kind: flattening must stop at the
+	path or the inner names would become un-validatable individual keys.
+]]
+local function map(path: string): Spec
+	return { path = path, kind = "map", default = {} }
 end
 
 -- A key the running script owns rather than the user's saved settings (pause,
@@ -1197,8 +1213,29 @@ local SCHEMA: { Spec } = {
 	str("crystal.selected", ""),
 	num("crystal.rate", 2, 1, 20),
 	bool("crystal.autoSell", false),
-	-- The pet names to auto-sell, as the same { name, count } list the pet
-	-- presets use (the count is ignored by the payload -- see core/CrystalList).
+	--[[
+		WHICH PETS OF EACH CRYSTAL ARE SOLD.
+
+		`{ [crystalName] = { [petName] = true } }` -- a ticked pet is sold, and
+		everything NOT ticked is kept. That is the user's correction of the old
+		behaviour, where one button dumped the crystal's entire pool into the sell
+		list: "实际上应该是让我来选择出售哪些宠物，就是该水晶的哪些宠物，并且都是
+		会保留的".
+
+		Per crystal rather than one flat list, because the pools overlap by name
+		and switching crystals must not silently change what is sold.
+	]]
+	map("crystal.sellByCrystal"),
+	--[[
+		DEPRECATED, and declared only so an older config still parses.
+
+		The previous build stored one flat `{ name, count }` list here; 1008 -> 1009
+		converts it into `crystal.sellByCrystal` under the crystal that was
+		selected at the time, and removes it. It stays declared because `preset` is
+		a LEAF kind: without the declaration the loader would FLATTEN the old array
+		into `crystal.sellPets.1.name` keys and the migration would never see the
+		list it has to convert.
+	]]
 	preset("crystal.sellPets"),
 
 	-- teleport ---------------------------------------------------------------
@@ -1214,9 +1251,47 @@ local SCHEMA: { Spec } = {
 	bool("kill.single", false),
 	str("kill.singleName", ""),
 	bool("kill.approach", true),
-	num("kill.range", 400, 20, 2000),
 	--[[
-		HOW LONG EACH HAND KEEPS THE TOOL ("两两齐平").
+		DEPRECATED, and LIVE on purpose: 全图杀戮 no longer has a range cap.
+
+		The user's rule is "搜索范围是不限制的，它是搜索全图玩家", so the free scan
+		asks for the whole map and this number is never read. It stays declared (as
+		a LIVE key, so a file from the previous build neither warns "unknown key
+		dropped" nor has its value honoured) purely so old configs keep loading
+		cleanly -- the same treatment `boss.hoverHeight` got when its slider went
+		away.
+	]]
+	liveNum("kill.range", 400),
+	--[[
+		CAN WE ACTUALLY WIN? On by default, because the user asked for it as part
+		of what 全图杀戮 should do: "计算是否打得过。如果打不过直接跳过".
+
+		`kill.powerMaxHits` is the "相差过大 → 打不死" half: a target whose
+		durability needs more than this many punches is skipped even when we would
+		win the race. Everything else about the comparison (命中数赛跑) is
+		core/Duel's, and it is pure and tested.
+	]]
+	bool("kill.powerCheck", true),
+	num("kill.powerMaxHits", 30, 1, 500),
+	--[[
+		HOW LONG ONE TARGET MAY HOLD THE LOCK ("如果超时 10 秒没打过，那就给它跳过").
+
+		`kill.targetSkip` is what makes that mean anything: a timed-out player is
+		remembered for this long and not considered again, so the loop does not
+		simply re-pick the same nearest player on the next scan.
+	]]
+	num("kill.targetTimeout", 10, 2, 120),
+	num("kill.targetSkip", 60, 0, 3600),
+	--[[
+		SKIP THE NO-DAMAGE AREAS (the seasonal gym, the island, the boss arena).
+
+		On by default because the user asked for all three, but switchable: the
+		first version over-skipped ("有很多人异常打不到，很多玩家都被异常跳过了")
+		and the fix for that has to be one click away as well as narrower.
+	]]
+	bool("kill.skipSafeZones", true),
+	--[[
+		HOW LONG EACH HAND KEEPS THE TOOL.
 
 		Training and punching cannot both hold the hand, so with training enabled
 		during combat the hand alternates. The bug this replaces was a pacing
@@ -1224,8 +1299,12 @@ local SCHEMA: { Spec } = {
 		while the glove was ALSO re-equipped on every punch, so the training tool
 		never stayed on long enough to register a rep. Both halves now hold for
 		the same `kill.dualInterval` seconds.
+
+		The DEFAULT is 0.15 s: the user's own number after two rounds of "工具切换
+		太慢了" ("比如说 0.15 秒切换换一次"). One number for both halves keeps the
+		swap rates equal by construction; the setting still spans 0.1-3 s.
 	]]
-	num("kill.dualInterval", 0.6, 0.1, 3),
+	num("kill.dualInterval", 0.15, 0.1, 3),
 	--[[
 		THE OVERHEAD APPROACH.
 
@@ -1392,6 +1471,24 @@ local SCHEMA: { Spec } = {
 	num("follow.gap", 30, 5, 600),
 	num("follow.waitSeconds", 600, 30, 7200),
 	num("follow.maxAttempts", 4, 1, 20),
+	--[[
+		THE SWEEP ("一直尝试"), default ON.
+
+		The presence lookup is the only way to learn WHICH server the target is
+		on, and it can come back with nothing -- a hidden online status, an
+		executor whose HTTP returns nothing, or an API answer this build does not
+		parse. Waiting in that case was the reported "根本没法获取到", so with
+		this on the script walks the public server list one server at a time; the
+		target is found the moment a hop lands on him, because being in the same
+		server needs no API at all.
+
+		`sweepGap` is the pause between hops (the join verdict alone takes 20 s),
+		and the cursor/stamp are PERSISTED because every hop is a new session.
+	]]
+	bool("follow.sweep", true),
+	num("follow.sweepGap", 20, 5, 600),
+	num("follow.sweepCursor", 0, 0, 1000000),
+	num("follow.sweepAt", 0, 0, 4000000000),
 
 	--[[
 		Metadata that travels INSIDE a config file rather than describing a
@@ -1536,7 +1633,7 @@ end
 
 -- Kinds whose value is a record, not a subtree: flattening must stop here or a
 -- position like { xs = 0, xo = 640 } would become un-validatable leaf paths.
-local LEAF_KINDS: { [string]: boolean } = { position = true, preset = true }
+local LEAF_KINDS: { [string]: boolean } = { position = true, preset = true, map = true }
 
 --[[
 	Migrations, keyed by the version they upgrade FROM.
@@ -1550,6 +1647,46 @@ local MIGRATIONS: Steps = {
 	-- only has to stamp the version. It exists as a real entry so that the next
 	-- rename has an obvious home.
 	[1007] = function(_data: { [string]: any }) end,
+	--[[
+		1008 -> 1009: the crystal auto-sell list became per crystal.
+
+		The old shape was one flat `{ name, count }` array at
+		`crystal.sellPets`; it is moved under whatever crystal was selected at the
+		time, because the old list was always "the pets of the crystal you had
+		chosen". The old key is then REMOVED, so a converted file does not keep
+		carrying a second copy of the same selection (and so the deprecated schema
+		entry only ever holds its default).
+	]]
+	[1008] = function(data: { [string]: any })
+		local old = data["crystal.sellPets"]
+		if type(old) ~= "table" then
+			return
+		end
+		local crystal = data["crystal.selected"]
+		if type(crystal) ~= "string" or crystal == "" then
+			-- No crystal recorded: there is nothing to attach the names to, so
+			-- they are dropped rather than filed under a placeholder that no
+			-- crystal picker could ever match.
+			data["crystal.sellPets"] = nil
+			return
+		end
+		local byCrystal = data["crystal.sellByCrystal"]
+		if type(byCrystal) ~= "table" then
+			byCrystal = {}
+			data["crystal.sellByCrystal"] = byCrystal
+		end
+		local entry = byCrystal[crystal]
+		if type(entry) ~= "table" then
+			entry = {}
+			byCrystal[crystal] = entry
+		end
+		for _, row in ipairs(old) do
+			if type(row) == "table" and type(row.name) == "string" and row.name ~= "" then
+				entry[row.name] = true
+			end
+		end
+		data["crystal.sellPets"] = nil
+	end,
 }
 
 local function defaultFor(spec: Spec): any
@@ -1628,6 +1765,47 @@ local function validate(spec: Spec, raw: any): (any, string?)
 					count = math.max(1, math.floor(count)),
 				})
 			end
+		end
+		return out
+	end
+
+	if kind == "map" then
+		if type(raw) ~= "table" then
+			return defaultFor(spec), "expected a map table"
+		end
+		--[[
+			One level of nesting, strings for keys and booleans for values.
+
+			Anything else is DROPPED (and warned about) rather than repaired: this
+			holds user selections from a UI, so an unexpected shape means the file
+			was hand-edited or written by a different build -- guessing what was
+			meant would be worse than starting that entry empty.
+		]]
+		local out: { [string]: any } = {}
+		local dropped = false
+		for key, value in pairs(raw) do
+			if type(key) == "string" then
+				if type(value) == "boolean" then
+					out[key] = value
+				elseif type(value) == "table" then
+					local nested: { [string]: boolean } = {}
+					for innerKey, innerValue in pairs(value) do
+						if type(innerKey) == "string" and type(innerValue) == "boolean" then
+							nested[innerKey] = innerValue
+						else
+							dropped = true
+						end
+					end
+					out[key] = nested
+				else
+					dropped = true
+				end
+			else
+				dropped = true
+			end
+		end
+		if dropped then
+			return out, "some map entries were not name -> boolean and were dropped"
 		end
 		return out
 	end
@@ -3413,6 +3591,36 @@ export type Candidate = {
 	alive: boolean,
 	friend: boolean,
 	self: boolean,
+	--[[
+		In an area where damage does not apply (the seasonal gym, the island).
+
+		The user's rule for 全图杀戮: "如果目标玩家在万圣节健身房，或者在小岛，
+		那么就直接跳过，因为这个玩家打不死". A candidate flagged here is never
+		chosen by the FREE scan -- but it does not veto a LOCKED target, because
+		naming someone explicitly is a different statement from "kill whoever is
+		reachable".
+	]]
+	protected: boolean?,
+	--[[
+		Would we actually win the fight? Computed by the caller from both sides'
+		strength and durability (see core/Duel) because only the adapter can read
+		those numbers.
+
+		`false` means "cannot win", `nil` means "not judged" (missing data), and
+		only the FREE scan skips it -- a hand-picked target is still attacked,
+		which is what "单独击杀" means.
+	]]
+	winnable: boolean?,
+	--[[
+		We have already spent `kill.targetTimeout` seconds on this player without
+		killing them (see core/TargetLock), so they are out of the pool until the
+		skip expires.
+
+		Without this the timeout alone changed nothing: the very next scan picks
+		the same nearest player again, and the loop rotates between two candidates
+		forever -- the "老是执着于打一个人" the timeout exists to end.
+	]]
+	skipped: boolean?,
 }
 
 export type Rules = {
@@ -3454,6 +3662,9 @@ end
 	    "only-self"         -- the local player was the only candidate
 	    "all-dead"          -- every candidate was dead
 	    "all-friends"       -- every live candidate is a friend
+	    "all-protected"     -- everyone left is in a no-damage area (gym / island / arena)
+	    "all-unwinnable"    -- everyone left would win the fight (core/Duel)
+	    "all-skipped"       -- everyone left is on a timeout cooldown (core/TargetLock)
 	    "all-out-of-range"  -- live, non-friend candidates exist but none is close enough
 ]]
 function Targeting.select(candidates: { Candidate }, origin: Vec3, rules: Rules): Decision
@@ -3472,7 +3683,9 @@ function Targeting.select(candidates: { Candidate }, origin: Vec3, rules: Rules)
 		if rules.respectFriends and candidate.friend then
 			return { id = nil, reason = "locked-friend" }
 		end
-		-- Deliberately no range check: the user named this target.
+		-- Deliberately no range check, no safe-zone check and no power check: the
+		-- user named this target, so the only vetoes are the ones about the
+		-- target being attackable at all.
 		return { id = candidate.id, reason = "locked" }
 	end
 
@@ -3484,6 +3697,7 @@ function Targeting.select(candidates: { Candidate }, origin: Vec3, rules: Rules)
 	local otherThanSelf = 0
 	local aliveOthers = 0
 	local eligible = 0
+	local reachable = 0
 	local bestId: string? = nil
 	local bestDistance: number? = nil
 
@@ -3500,6 +3714,19 @@ function Targeting.select(candidates: { Candidate }, origin: Vec3, rules: Rules)
 			continue
 		end
 		eligible += 1
+		-- The two "not worth attacking" filters. Both are about the FREE scan
+		-- only, and both are counted separately from `eligible` so the reason
+		-- below can name the one that actually emptied the pool.
+		if candidate.protected == true then
+			continue
+		end
+		if candidate.winnable == false then
+			continue
+		end
+		if candidate.skipped == true then
+			continue
+		end
+		reachable += 1
 		local distance = Targeting.distance(candidate.position, origin)
 		if distance <= rules.range and (bestDistance == nil or distance < bestDistance) then
 			bestDistance = distance
@@ -3521,6 +3748,25 @@ function Targeting.select(candidates: { Candidate }, origin: Vec3, rules: Rules)
 	end
 	if eligible == 0 then
 		return { id = nil, reason = "all-friends" }
+	end
+	if reachable == 0 then
+		--[[
+			Which of the three filters did it is worth distinguishing: "everyone
+			is in the gym", "everyone out-punches me" and "everyone is on a
+			timeout cooldown" are three different answers to "why is nothing
+			being attacked".
+		]]
+		for _, candidate in ipairs(candidates) do
+			if not candidate.self and candidate.alive and candidate.protected == true then
+				return { id = nil, reason = "all-protected" }
+			end
+		end
+		for _, candidate in ipairs(candidates) do
+			if not candidate.self and candidate.alive and candidate.skipped == true then
+				return { id = nil, reason = "all-skipped" }
+			end
+		end
+		return { id = nil, reason = "all-unwinnable" }
 	end
 	return { id = nil, reason = "all-out-of-range" }
 end
@@ -8459,6 +8705,580 @@ end
 return Tools
 end
 
+__modules["core/Duel"] = function()
+-- (module directive --!strict; the bundle is --!nonstrict)
+--[[
+	Duel -- "can we actually kill this player?" Pure.
+
+	The user's rule for 全图杀戮:
+
+	    会通过计算我方的力量和耐力和对方的力量和耐力来计算是否打得过。如果打不过
+	    直接跳过……如果他先计算出理论上他先打死我，而不是我先打死他，那就直接跳过。
+	    然后呢如果我方力量跟对方的耐力相差过大，那么的话就说明你打不死他，那也跳过
+
+	i.e. two independent skip conditions, both from the same four numbers:
+
+	  * 耐力 equals HP (the user's own definition), and a punch's damage scales with
+	    力量, so the fight is a RACE of hit counts:
+
+	        we need      theirDurability / ourStrength   punches
+	        they need    ourDurability   / theirStrength punches
+
+	    Whoever needs fewer wins. If THEY need fewer, we lose -- skip.
+	  * AND EVEN IF WE WIN THE RACE, a target whose durability is far above our
+	    strength takes an absurd number of punches. That is the "力量跟对方的耐力
+	    相差过大 → 打不死" half, and it is a separate cap because "we win in 400
+	    hits" is not a fight worth starting.
+
+	Everything is a plain ratio, so the game's damage formula never has to be
+	known exactly: the absolute scale cancels out of the race, and the only
+	number with a unit is `maxHits`, which the user can tune.
+
+	MISSING DATA NEVER SKIPS. If our strength, their durability or their strength
+	cannot be read, `winnable` answers true with a reason of nil -- refusing to
+	attack because a leaderboard value did not load would make the feature look
+	broken, which is the failure mode this project keeps having to fix.
+]]
+
+local Duel = {}
+
+export type Side = {
+	strength: number?,
+	durability: number?,
+}
+
+export type Options = {
+	maxHits: number?,
+	--[[
+		HOW CLEAR the loss has to be before we skip.
+
+		Added after the first real-machine report: "有很多人异常打不到，很多玩家都被
+		异常跳过了". A bare `theirHits <= ourHits` skip fires on a tie and on a 1%
+		difference, and the two leaderboard numbers are not guaranteed to be on the
+		same scale (one may be a damage figure and the other a health figure with
+		different bases). Requiring the target to be this many times better before
+		we refuse turns "we would probably lose" into "we would certainly lose",
+		which is what the user actually asked for.
+	]]
+	margin: number?,
+}
+
+export type Verdict = {
+	winnable: boolean,
+	reason: string?,
+	-- Diagnostics for the UI: how many punches each side would need, when known.
+	ourHits: number?,
+	theirHits: number?,
+}
+
+Duel.DEFAULT_MAX_HITS = 30
+Duel.DEFAULT_MARGIN = 2
+
+local function positive(value: number?): number?
+	if value == nil or value ~= value or value <= 0 then
+		return nil
+	end
+	return value
+end
+
+function Duel.verdict(mine: Side, theirs: Side, options: Options?): Verdict
+	local opts: Options = options or {}
+	local maxHits = opts.maxHits or Duel.DEFAULT_MAX_HITS
+	if maxHits < 1 then
+		maxHits = 1
+	end
+
+	local myStrength = positive(mine.strength)
+	local theirDurability = positive(theirs.durability)
+	local theirStrength = positive(theirs.strength)
+
+	-- No usable numbers on either side: not judged, so not skipped.
+	if myStrength == nil or theirDurability == nil then
+		return { winnable = true, reason = nil, ourHits = nil, theirHits = nil }
+	end
+
+	local ourHits = theirDurability / myStrength
+	-- Their durability is known but their strength is not: the race cannot be
+	-- judged, so only the "too many hits" cap applies.
+	if theirStrength == nil then
+		if ourHits > maxHits then
+			return {
+				winnable = false,
+				reason = string.format("打不死：要 %d 拳（力量 %s vs 耐力 %s）",
+					math.ceil(ourHits), tostring(math.floor(myStrength)), tostring(math.floor(theirDurability))),
+				ourHits = ourHits,
+				theirHits = nil,
+			}
+		end
+		return { winnable = true, reason = nil, ourHits = ourHits, theirHits = nil }
+	end
+
+	local myDurability = positive(mine.durability)
+	if myDurability == nil then
+		-- Our own HP is unreadable: we cannot say they would win, so only the
+		-- hit-count cap decides.
+		if ourHits > maxHits then
+			return {
+				winnable = false,
+				reason = string.format("打不死：要 %d 拳", math.ceil(ourHits)),
+				ourHits = ourHits,
+				theirHits = nil,
+			}
+		end
+		return { winnable = true, reason = nil, ourHits = ourHits, theirHits = nil }
+	end
+
+	local theirHits = myDurability / theirStrength
+	local margin = opts.margin or Duel.DEFAULT_MARGIN
+	if margin < 1 then
+		margin = 1
+	end
+	--[[
+		A CLEAR loss, not a tie and not a coin flip: they must need fewer punches
+		by a factor of `margin` before we refuse to fight. See Options.margin.
+	]]
+	if theirHits * margin <= ourHits then
+		return {
+			winnable = false,
+			reason = string.format("打不过：他会先打死你（他 %d 拳 / 你 %d 拳）",
+				math.ceil(theirHits), math.ceil(ourHits)),
+			ourHits = ourHits,
+			theirHits = theirHits,
+		}
+	end
+	if ourHits > maxHits then
+		return {
+			winnable = false,
+			reason = string.format("打不死：要 %d 拳（超过上限 %d）", math.ceil(ourHits), maxHits),
+			ourHits = ourHits,
+			theirHits = theirHits,
+		}
+	end
+
+	return { winnable = true, reason = nil, ourHits = ourHits, theirHits = theirHits }
+end
+
+return Duel
+end
+
+__modules["core/SafeZones"] = function()
+-- (module directive --!strict; the bundle is --!nonstrict)
+--[[
+	SafeZones -- where a player cannot be killed. Pure.
+
+	The user's rule for 全图杀戮:
+
+	    搜索范围是不限制的，它是搜索全图玩家。但是如果目标玩家在万圣节健身房，
+	    或者在小岛，那么就直接跳过，因为这个玩家打不死
+
+	Two places, and both are worth stating as DATA rather than as a radius buried
+	in the kill loop:
+
+	    万圣节健身房 (Hallowed Gym)  the seasonal area -- a different map entirely,
+	                                and the arena's own damage rules do not apply
+	                                outside it
+	    小岛 (the island)            the beach area at the same coordinates the
+	                                teleport list calls 小岛 and the gym list calls
+	                                海滩
+
+	TWO WAYS TO KNOW, and the union of them is deliberate:
+
+	  * the game's own NAME for the area, when it is readable. `currentMap` is a
+	    StringValue the game publishes, and each character carries an
+	    `InHalloweenArena` attribute -- that is an answer from the game, not a
+	    guess.
+	  * the DISTANCE from the two known centres, as the fallback. A remote
+	    player's `currentMap` is not guaranteed to replicate to us, so relying on
+	    the name alone would silently stop protecting anyone the moment the game
+	    changes what it replicates.
+
+	Distance is Chebyshev-free and plain: the horizontal radius of the area.
+]]
+
+local SafeZones = {}
+
+export type Vec3 = { x: number, y: number, z: number }
+
+--[[
+	The protected areas, by the coordinates this project already uses everywhere
+	else (core/Teleports' 万圣节健身房 / 小岛, core/MachinePlan's 万圣节健身房 /
+	海滩).
+
+	Typed LOCALS rather than annotated field assignments: `SafeZones.AREAS: T = {}`
+	is not valid Luau -- an annotation is only allowed on a local declaration (the
+	same trap core/Hold documents).
+
+	THE BOSS ARENA IS NOT HERE, and that is deliberate: it is a folder
+	(`Workspace.Events.BossArena`) whose position only the engine knows, so the
+	adapter computes its centre and passes it in as an EXTRA area (see
+	SafeZones.isProtected's fourth argument). Hard-coding a coordinate for it
+	would be a guess that silently stops protecting anyone when the map moves.
+]]
+export type Area = {
+	name: string,
+	label: string,
+	x: number,
+	y: number,
+	z: number,
+	radius: number,
+}
+
+local AREAS: { Area } = {
+	{ name = "hallowedGym", label = "万圣节健身房", x = 5505.53, y = 96.32, z = 5893.50, radius = 320 },
+	{ name = "island", label = "小岛", x = -32.14, y = 11.51, z = 1904.41, radius = 260 },
+}
+
+--[[
+	Name fragments that mean "this is a protected area".
+
+	DELIBERATELY NARROW. The first version also accepted "island", "beach" and
+	"arena"/"竞技场", and the user's very next report was "有很多人异常打不到，
+	很多玩家都被异常跳过了" -- a map string that merely contains one of those
+	words is not an area where damage is disabled, and a false positive silently
+	removes a player from the kill list.
+
+	So the NAME channel is now only the one area whose name the game itself
+	publishes for us ("Hallowed Gym", checked by Boss.inHallowedGym since the
+	first round). The island and the boss arena are matched by their
+	COORDINATES and by the character attribute, which are facts rather than
+	substrings.
+]]
+local KEYWORDS: { string } = {
+	"hallowed",
+	"halloween",
+	"万圣节",
+}
+
+-- How wide the boss arena is treated as being, around its computed centre.
+SafeZones.ARENA_RADIUS = 400
+
+SafeZones.AREAS = AREAS
+SafeZones.KEYWORDS = KEYWORDS
+
+function SafeZones.matches(mapName: string?): boolean
+	if mapName == nil or mapName == "" then
+		return false
+	end
+	local lowered = string.lower(mapName)
+	for _, keyword in ipairs(SafeZones.KEYWORDS) do
+		if string.find(lowered, string.lower(keyword), 1, true) ~= nil then
+			return true
+		end
+	end
+	return false
+end
+
+-- Which area (if any) is this position inside? nil when it is in the open world.
+--
+-- `extra` carries the areas only the caller can compute (the boss arena's centre
+-- comes from `Workspace.Events.BossArena`) -- they are checked the same way, so
+-- the pure decision does not have to know where they came from.
+function SafeZones.areaAt(position: Vec3?, extra: { Area }?): string?
+	if position == nil then
+		return nil
+	end
+	for _, area in ipairs(AREAS) do
+		local dx, dy, dz = position.x - area.x, position.y - area.y, position.z - area.z
+		if math.sqrt(dx * dx + dy * dy + dz * dz) <= area.radius then
+			return area.name
+		end
+	end
+	if extra ~= nil then
+		for _, area in ipairs(extra) do
+			local dx, dy, dz = position.x - area.x, position.y - area.y, position.z - area.z
+			if math.sqrt(dx * dx + dy * dy + dz * dz) <= area.radius then
+				return area.name
+			end
+		end
+	end
+	return nil
+end
+
+--[[
+	Should this candidate be skipped?
+
+	`mapName` is the game's own name for where the player is (nil when it is not
+	readable), `inArena` is the character's `InHalloweenArena` attribute,
+	`position` is where the player actually is, and `extra` are the runtime areas
+	(see areaAt).
+]]
+function SafeZones.isProtected(
+	position: Vec3?,
+	mapName: string?,
+	inArena: boolean?,
+	extra: { Area }?
+): boolean
+	if inArena == true then
+		return true
+	end
+	if SafeZones.matches(mapName) then
+		return true
+	end
+	return SafeZones.areaAt(position, extra) ~= nil
+end
+
+-- A label for the UI/log, or nil when the area is unknown.
+function SafeZones.labelFor(position: Vec3?, mapName: string?, extra: { Area }?): string?
+	if SafeZones.matches(mapName) then
+		return "安全区"
+	end
+	local area = SafeZones.areaAt(position, extra)
+	if area == nil then
+		return nil
+	end
+	for _, entry in ipairs(AREAS) do
+		if entry.name == area then
+			return entry.label
+		end
+	end
+	if extra ~= nil then
+		for _, entry in ipairs(extra) do
+			if entry.name == area then
+				return entry.label
+			end
+		end
+	end
+	return area
+end
+
+return SafeZones
+end
+
+__modules["core/TargetLock"] = function()
+-- (module directive --!strict; the bundle is --!nonstrict)
+--[[
+	TargetLock -- how long we may keep attacking the same player, and who we have
+	given up on. Pure.
+
+	The user's report, and the two rules it implies:
+
+	    老是执着于打一个人……应该有一个超时机制，就是如果超时 10 秒没打过，
+	    那就给它跳过
+
+	Step one is a TIMEOUT: a lock older than `timeout` is dropped, because a target
+	we have been hitting for ten seconds without killing is either out of reach,
+	out-healing us, or protected -- and the loop should try somebody else.
+
+	Step two is what makes that mean anything: a SKIP MEMORY. Dropping a lock
+	alone changes nothing, because the very next scan picks the same player again
+	(they were the nearest) and the loop rotates between two candidates forever.
+	So a timed-out target is remembered with an expiry and is not considered
+	again until then.
+
+	Deliberately separate from core/Targeting (which decides WHO, given the
+	candidates) and from the adapter (which knows what "still valid" means): this
+	is only the bookkeeping over time, which is what makes it testable.
+]]
+
+local TargetLock = {}
+TargetLock.__index = TargetLock
+
+export type Options = {
+	-- How long one target may hold the lock before we move on.
+	timeout: number?,
+	-- How long a timed-out target stays out of the candidate pool.
+	skipSeconds: number?,
+}
+
+export type Verdict = {
+	-- "keep"    -- stay on this target
+	-- "timeout" -- held too long; the lock is dropped and the target skipped
+	-- "invalid" -- the caller said it is no longer attackable; lock dropped
+	action: string,
+	reason: string,
+	id: string?,
+}
+
+export type TargetLock = {
+	_timeout: number,
+	_skipSeconds: number,
+	_id: string?,
+	_lockedAt: number,
+	_skips: { [string]: number },
+	_timeouts: number,
+	status: (TargetLock) -> { id: string?, held: number, timeouts: number, skipped: number },
+	configure: (TargetLock, Options?) -> (),
+	lock: (TargetLock, string?, number) -> (),
+	release: (TargetLock) -> (),
+	target: (TargetLock) -> string?,
+	held: (TargetLock, number) -> number,
+	step: (TargetLock, number, boolean) -> Verdict,
+	skip: (TargetLock, string?, number) -> (),
+	isSkipped: (TargetLock, string?, number) -> boolean,
+	skipCount: (TargetLock, number) -> number,
+	skippedIds: (TargetLock, number) -> { string },
+	clear: (TargetLock) -> (),
+}
+
+TargetLock.DEFAULT_TIMEOUT = 10
+TargetLock.DEFAULT_SKIP = 60
+
+local function clampNumber(value: number?, fallback: number, low: number, high: number): number
+	local resolved = value or fallback
+	if resolved ~= resolved then
+		resolved = fallback
+	end
+	if resolved < low then
+		return low
+	end
+	if resolved > high then
+		return high
+	end
+	return resolved
+end
+
+local function prune(self: TargetLock, now: number)
+	for id, until_ in pairs(self._skips) do
+		if until_ <= now then
+			self._skips[id] = nil
+		end
+	end
+end
+
+function TargetLock.new(options: Options?): TargetLock
+	local opts: Options = options or {}
+	local self = setmetatable({
+		_timeout = clampNumber(opts.timeout, TargetLock.DEFAULT_TIMEOUT, 0.5, 3600),
+		_skipSeconds = clampNumber(opts.skipSeconds, TargetLock.DEFAULT_SKIP, 0, 86400),
+		_id = nil,
+		_lockedAt = 0,
+		_skips = {},
+		_timeouts = 0,
+	}, TargetLock)
+	return (self :: any) :: TargetLock
+end
+
+function TargetLock.configure(self: TargetLock, options: Options?)
+	local opts: Options = options or {}
+	self._timeout = clampNumber(opts.timeout, self._timeout, 0.5, 3600)
+	self._skipSeconds = clampNumber(opts.skipSeconds, self._skipSeconds, 0, 86400)
+end
+
+--[[
+	Take (or keep) the lock.
+
+	The clock is NOT restarted when the same id is locked again: the caller may
+	re-select the same target on every scan, and restarting the clock each time
+	would mean the timeout never fires -- which is exactly the "执着于打一个人"
+	the timeout exists to end.
+]]
+function TargetLock.lock(self: TargetLock, id: string?, now: number)
+	if id == nil or id == "" then
+		TargetLock.release(self)
+		return
+	end
+	if self._id ~= id then
+		self._id = id
+		self._lockedAt = now
+	end
+end
+
+function TargetLock.release(self: TargetLock)
+	self._id = nil
+	self._lockedAt = 0
+end
+
+function TargetLock.target(self: TargetLock): string?
+	return self._id
+end
+
+function TargetLock.held(self: TargetLock, now: number): number
+	if self._id == nil then
+		return 0
+	end
+	return math.max(0, now - self._lockedAt)
+end
+
+--[[
+	One frame's decision about the current lock.
+
+	`valid` is the caller's answer to "is this still attackable right now"
+	(present, alive, not a friend). An invalid target is dropped WITHOUT being
+	skipped: it is gone or dead, so there is nothing to remember.
+]]
+function TargetLock.step(self: TargetLock, now: number, valid: boolean): Verdict
+	local id = self._id
+	if id == nil then
+		return { action = "keep", reason = "无锁定", id = nil }
+	end
+	if valid ~= true then
+		self._id = nil
+		self._lockedAt = 0
+		return { action = "invalid", reason = "目标已不可攻击", id = id }
+	end
+	if now - self._lockedAt > self._timeout then
+		self._id = nil
+		self._lockedAt = 0
+		TargetLock.skip(self, id, now)
+		self._timeouts += 1
+		return { action = "timeout", reason = "超时未击杀，换下一个目标", id = id }
+	end
+	return { action = "keep", reason = "", id = id }
+end
+
+-- Put a target out of consideration for `skipSeconds`.
+function TargetLock.skip(self: TargetLock, id: string?, now: number)
+	if id == nil or id == "" or self._skipSeconds <= 0 then
+		return
+	end
+	self._skips[id] = now + self._skipSeconds
+end
+
+function TargetLock.isSkipped(self: TargetLock, id: string?, now: number): boolean
+	if id == nil then
+		return false
+	end
+	local until_ = self._skips[id]
+	if until_ == nil then
+		return false
+	end
+	if until_ <= now then
+		self._skips[id] = nil
+		return false
+	end
+	return true
+end
+
+function TargetLock.skipCount(self: TargetLock, now: number): number
+	prune(self, now)
+	local count = 0
+	for _ in pairs(self._skips) do
+		count += 1
+	end
+	return count
+end
+
+function TargetLock.skippedIds(self: TargetLock, now: number): { string }
+	prune(self, now)
+	local out: { string } = {}
+	for id in pairs(self._skips) do
+		table.insert(out, id)
+	end
+	table.sort(out)
+	return out
+end
+
+function TargetLock.clear(self: TargetLock)
+	table.clear(self._skips)
+	TargetLock.release(self)
+end
+
+function TargetLock.status(self: TargetLock)
+	local skipped = 0
+	for _ in pairs(self._skips) do
+		skipped += 1
+	end
+	return {
+		id = self._id,
+		held = if self._id == nil then 0 else -1,
+		timeouts = self._timeouts,
+		skipped = skipped,
+	}
+end
+
+return TargetLock
+end
+
 __modules["game/Pets"] = function()
 	local require = __require
 -- (module directive --!nonstrict; the bundle is --!nonstrict)
@@ -9000,6 +9820,49 @@ end
 return Pets
 end
 
+__modules["game/PlayerStats"] = function()
+-- (module directive --!nonstrict; the bundle is --!nonstrict)
+--[[
+	PlayerStats -- reading the leaderboard values.
+
+	V1007's Core.stat looked in two places: a direct child, then leaderstats. The
+	direct-child lookup is nearly always a miss (the game keeps these under
+	leaderstats), but it is kept because it costs one failed lookup and some
+	versions expose them flat.
+]]
+
+local PlayerStats = {}
+
+function PlayerStats.value(player, name): number
+	if player == nil or name == nil then
+		return 0
+	end
+	local direct = player:FindFirstChild(name)
+	if direct ~= nil and direct:IsA("ValueBase") then
+		return tonumber(direct.Value) or 0
+	end
+	local leaderstats = player:FindFirstChild("leaderstats")
+	if leaderstats ~= nil then
+		local value = leaderstats:FindFirstChild(name)
+		if value ~= nil and value:IsA("ValueBase") then
+			return tonumber(value.Value) or 0
+		end
+	end
+	return 0
+end
+
+function PlayerStats.snapshot(player)
+	return {
+		strength = PlayerStats.value(player, "Strength"),
+		rebirths = PlayerStats.value(player, "Rebirths"),
+		gems = PlayerStats.value(player, "Gems"),
+		durability = PlayerStats.value(player, "Durability"),
+	}
+end
+
+return PlayerStats
+end
+
 __modules["game/Combat"] = function()
 	local require = __require
 -- (module directive --!nonstrict; the bundle is --!nonstrict)
@@ -9028,10 +9891,14 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local Targeting = require("core/Targeting")
 local Arbiter = require("core/Arbiter")
+local Duel = require("core/Duel")
+local SafeZones = require("core/SafeZones")
+local TargetLock = require("core/TargetLock")
 local Tools = require("game/Tools")
 local Remotes = require("game/Remotes")
 local GameNet = require("game/Net")
 local Pets = require("game/Pets")
+local PlayerStats = require("game/PlayerStats")
 local Attributes = require("core/Attributes")
 
 local Combat = {}
@@ -9040,7 +9907,6 @@ Combat.__index = Combat
 local PUNCH_LEFT = "rbxassetid://3638729053"
 local PUNCH_RIGHT = "rbxassetid://3638767427"
 
-local LOCK_MAX_AGE = 15
 local SCAN_INTERVAL = 0.3
 local VALIDATE_INTERVAL = 0.1
 local KING_INTERVAL = 0.5
@@ -9050,12 +9916,13 @@ local PUNCH_MISSING_GRACE = 1.5
 	The boss punch cadence.
 
 	V1007 ran `Core.startBossPunch`: a loop that called `Core.doPunch`, flipped
-	the hand and waited 0.05s while the boss was alive. Same interval here, so
-	the wire traffic matches the version the game accepted -- the difference is
-	that it is a scheduler task now, so it shows up in the accounting, obeys the
-	punch channel's limiter, and dies with the runtime.
+	the hand and waited 0.05s while the boss was alive. Same shape here, but the
+	interval is the user's complaint -- "出拳速度也太慢了" -- so it is half of what
+	it was: the remote is what deals damage and the game's own cooldown value is
+	what caps it (Combat.punch zeroes the tool's cooldown NumberValue), so 0.025 s
+	is 40 punches a second with no animation wait in between.
 ]]
-local BOSS_PUNCH_INTERVAL = 0.05
+local BOSS_PUNCH_INTERVAL = 0.025
 
 -- How often the approach pose is written DIRECTLY (position + facing) while
 -- chasing a player. The user's number is 0.025 s, and this subsystem keeps its
@@ -9214,6 +10081,9 @@ function Combat.new(context)
 		-- too, and the two must not share a timer (different target, different
 		-- cadence under load).
 		teleport = context.teleport or nil,
+		-- Late-bound "is the gym machine holding the body" check (see
+		-- Combat.machineHeld): Machine is installed after Combat.
+		machineSeated = context.machineSeated or nil,
 		pinAt = 0,
 		lastPresetKey = nil,
 		-- Friend-whitelist state, refreshed through the external contract.
@@ -9237,6 +10107,19 @@ function Combat.new(context)
 		punchMissingSince = 0,
 		punches = 0,
 		lastReason = "idle",
+		--[[
+			The lock's clock and its skip memory: "老是执着于打一个人" is answered
+			by core/TargetLock (a timeout) plus the skip list it keeps, so the next
+			scan cannot re-pick the player we just gave up on.
+		]]
+		lock = TargetLock.new(),
+		-- Counts for the page: how many candidates the two skip rules removed, and
+		-- why. "很多人异常打不到" is unanswerable without this.
+		skipStats = { protected = 0, unwinnable = 0, skipped = 0, arena = 0, total = 0 },
+		-- The boss arena's computed centre (`Workspace.Events.BossArena`), cached
+		-- because it is a tree walk.
+		arenaAreas = nil,
+		arenaAt = 0,
 		-- Boss attack state, mirroring V1007's startBossPunch loop.
 		bossPunchAt = 0,
 		bossHandLeft = false,
@@ -9280,9 +10163,105 @@ function Combat.isBusy(self): boolean
 	return false
 end
 
+--[[
+	EVERY player in the server, with the two "not worth attacking" judgements the
+	free scan needs:
+
+	    protected -- he is in the seasonal gym or on the island, where damage does
+	                 not apply ("在万圣节健身房，或者在小岛，那么就直接跳过，因为
+	                 这个玩家打不死")
+	    winnable  -- core/Duel's verdict on strength-vs-durability ("如果理论上是
+	                 他先打死我，那就直接跳过")
+
+	Both are computed HERE because both need engine data (positions, the game's
+	`currentMap`, the leaderboard values); the DECISION to skip them lives in
+	core/Targeting, so the reason a selection failed is still reportable.
+]]
+--[[
+	THE BOSS ARENA, as areas.
+
+	The user wants the arena to be a skip area too ("希望在 boss 竞技场的人也不打"),
+	and it is the one protected place whose coordinates are NOT in the tables this
+	project ships: it is a folder of slots (`Workspace.Events.BossArena.Boss1` …)
+	whose position only the engine knows. So one area PER SLOT is computed here
+	and handed to core/SafeZones as an extra -- with each slot's own radius, which
+	is more precise than one big circle over the whole folder.
+
+	Cached for a few seconds: this is a tree walk, and the slots do not move.
+]]
+local ARENA_CACHE = 10
+local ARENA_SLOT_RADIUS = 250
+
+function Combat.arenaAreas(self)
+	local now = os.clock()
+	if self.arenaAreas ~= nil and now - (self.arenaAt or 0) < ARENA_CACHE then
+		return self.arenaAreas
+	end
+	self.arenaAt = now
+	local out = {}
+	local events = Workspace:FindFirstChild("Events")
+	local arena = events ~= nil and events:FindFirstChild("BossArena") or nil
+	if arena ~= nil then
+		for _, slot in ipairs(arena:GetChildren()) do
+			local ok, position = pcall(function()
+				if slot:IsA("Model") then
+					return slot:GetPivot().Position
+				end
+				local part = slot:FindFirstChildWhichIsA("BasePart", true)
+				return if part ~= nil then part.Position else nil
+			end)
+			if ok and typeof(position) == "Vector3" then
+				table.insert(out, {
+					name = "bossArena",
+					label = "Boss 竞技场",
+					x = position.X,
+					y = position.Y,
+					z = position.Z,
+					radius = ARENA_SLOT_RADIUS,
+				})
+			end
+		end
+	end
+	self.arenaAreas = out
+	return out
+end
+
+--[[
+	EVERY player in the server, with the judgements the free scan needs:
+
+	    protected -- he is in a place where damage does not apply: the seasonal
+	                 gym, the island, or the boss arena (all three asked for by
+	                 the user). Switchable via `kill.skipSafeZones`.
+	    winnable  -- core/Duel's verdict on strength-vs-durability ("如果理论上是
+	                 他先打死我，那就直接跳过")
+	    skipped   -- we already spent `kill.targetTimeout` seconds on him without a
+	                 kill, so he is out of the pool until the skip expires
+
+	All three are computed HERE because they need engine data (positions, the
+	game's `currentMap`, the leaderboard values); the DECISION to skip lives in
+	core/Targeting, so the reason a selection failed is still reportable -- and
+	the counts are kept in `skipStats` for the page, because "很多人异常打不到"
+	was impossible to diagnose from the outside.
+]]
 function Combat.candidates(self)
 	local list = {}
 	local me = localPlayer()
+	local now = os.clock()
+	local powerCheck = self.store:get("kill.powerCheck") ~= false
+	local maxHits = tonumber(self.store:get("kill.powerMaxHits")) or Duel.DEFAULT_MAX_HITS
+	local safeZoneCheck = self.store:get("kill.skipSafeZones") ~= false
+	local arena = if safeZoneCheck then Combat.arenaAreas(self) else nil
+
+	local mine = nil
+	if powerCheck and me ~= nil then
+		mine = {
+			strength = PlayerStats.value(me, "Strength"),
+			durability = PlayerStats.value(me, "Durability"),
+		}
+	end
+
+	local stats = { protected = 0, unwinnable = 0, skipped = 0, arena = 0, total = 0 }
+
 	for _, player in ipairs(Players:GetPlayers()) do
 		local root, humanoid = rootOf(player)
 		if root ~= nil and humanoid ~= nil then
@@ -9290,16 +10269,68 @@ function Combat.candidates(self)
 				return root.Position
 			end)
 			if ok and typeof(position) == "Vector3" then
+				local plain = { x = position.X, y = position.Y, z = position.Z }
+				--[[
+					The map name is read from the PLAYER ("currentMap" is the
+					game's own StringValue and exists on every player, not just
+					ours); the attribute is the character's own flag. Both are
+					secondary: the coordinates are the authority (see core/SafeZones
+					about the over-skipping this replaced).
+				]]
+				local mapValue = player:FindFirstChild("currentMap")
+				local mapName = if mapValue ~= nil and mapValue:IsA("StringValue")
+					then tostring(mapValue.Value)
+					else nil
+				local inArena = false
+				local character = player.Character
+				if character ~= nil then
+					inArena = character:GetAttribute("InHalloweenArena") == true
+				end
+
+				local protected = false
+				if safeZoneCheck and player ~= me then
+					protected = SafeZones.isProtected(plain, mapName, inArena, arena)
+				end
+
+				local winnable = nil
+				local duelReason = nil
+				if powerCheck and (player ~= me) and me ~= nil then
+					local verdict = Duel.verdict(mine, {
+						strength = PlayerStats.value(player, "Strength"),
+						durability = PlayerStats.value(player, "Durability"),
+					}, { maxHits = maxHits })
+					winnable = verdict.winnable
+					duelReason = verdict.reason
+				end
+
+				local skipped = self.lock:isSkipped(player.Name, now)
+
+				stats.total += 1
+				if protected then
+					stats.protected += 1
+				end
+				if winnable == false then
+					stats.unwinnable += 1
+				end
+				if skipped then
+					stats.skipped += 1
+				end
+
 				table.insert(list, {
 					id = player.Name,
-					position = { x = position.X, y = position.Y, z = position.Z },
+					position = plain,
 					alive = humanoid.Health > 0,
 					friend = isFriend(player),
 					self = (player == me),
+					protected = protected,
+					winnable = winnable,
+					skipped = skipped,
+					duelReason = duelReason,
 				})
 			end
 		end
 	end
+	self.skipStats = stats
 	return list
 end
 
@@ -9336,7 +10367,16 @@ function Combat.select(self)
 	end
 
 	local decision = Targeting.select(Combat.candidates(self), { x = position.X, y = position.Y, z = position.Z }, {
-		range = tonumber(self.store:get("kill.range")) or 400,
+		--[[
+			UNLIMITED, because 全图杀戮 means the whole map: "搜索范围是不限制的，
+			它是搜索全图玩家". The old `kill.range` cap is what made the kill loop
+			ignore everyone past a few hundred studs -- and since a target that far
+			away is exactly the case the approach logic exists for, the cap only
+			ever hid work. `math.huge` keeps the distance arithmetic unchanged (the
+			nearest candidate still wins) and makes `all-out-of-range` unreachable
+			for the free scan.
+		]]
+		range = math.huge,
 		respectFriends = self.store:get("kill.friendWL") == true,
 		lockedId = lockedId,
 	})
@@ -9536,9 +10576,38 @@ function Combat.followPreset(self)
 	end
 end
 
+--[[
+	Is the GYM MACHINE holding the body right now?
+
+	A late-bound function (Machine is installed after Combat), and the same
+	question Boss asks: while the machine has the seat, the fight must not hold
+	the character, or the seat weld breaks and the machine remounts forever.
+]]
+function Combat.machineHeld(self): boolean
+	local check = self.machineSeated
+	if type(check) ~= "function" then
+		return false
+	end
+	local ok, seated = pcall(check)
+	return ok and seated == true
+end
+
 -- Close the distance through the motion kernel (so a pullback is corrected) and
 -- strike.
 function Combat.attack(self, target)
+	--[[
+		THE MACHINE WINS WHEN IT WAS ALLOWED TO.
+
+		`machine.overridesCombat` is the switch that lets the gym machine keep the
+		seat during a fight; the approach below holds the body (and a hold sets
+		`PlatformStand`), which would stand the player up out of the seat. So the
+		approach stands down while the machine actually has the seat -- and it
+		resumes by itself the moment the player is off it.
+	]]
+	if Combat.machineHeld(self) then
+		return
+	end
+
 	local myRoot = self.character:requireRoot()
 	local targetRoot = rootOf(target)
 	if myRoot == nil or targetRoot == nil then
@@ -9627,41 +10696,87 @@ function Combat.attack(self, target)
 end
 
 function Combat.tick(self, now)
+	--[[
+		HOW LONG ONE TARGET MAY HOLD THE LOCK, re-read every frame so the setting
+		takes effect at once.
+
+		The user's rule: "如果超时 10 秒没打过，那就给它跳过". core/TargetLock owns
+		the clock, and -- importantly -- the SKIP MEMORY that goes with it, because
+		dropping the lock on its own just makes the next scan pick the same nearest
+		player again ("老是执着于打一个人").
+	]]
+	self.lock:configure({
+		timeout = tonumber(self.store:get("kill.targetTimeout")),
+		skipSeconds = tonumber(self.store:get("kill.targetSkip")),
+	})
+
 	if self.locked ~= nil then
-		-- The staleness test is arithmetic and stays per-frame; the liveness test
-		-- walks the target's character (a root + humanoid lookup), so it is
-		-- throttled. Checking it 60x/second per locked target bought nothing --
-		-- a corpse can be punched harmlessly for a tenth of a second.
-		local stale = now - self.lockTime > LOCK_MAX_AGE
+		-- The liveness test walks the target's character (a root + humanoid
+		-- lookup), so it is throttled; the timeout itself is arithmetic and is
+		-- checked by `step` on every frame.
 		local valid = true
 		if now - self.validatedAt >= VALIDATE_INTERVAL then
 			self.validatedAt = now
-			valid = aliveRoot(self.locked) ~= nil
+			--[[
+				`aliveRoot` answers nil for a player who LEFT as well as for a
+				corpse -- the root and the humanoid both disappear with the model,
+				so "扫描不存在的对象" cannot keep a departed player locked.
+			]]
+			valid = (self.locked.Parent ~= nil) and (aliveRoot(self.locked) ~= nil)
 		end
-		if not valid or stale then
+
+		local verdict = self.lock:step(now, valid)
+		if verdict.action ~= "keep" then
+			if verdict.action == "timeout" then
+				self.lastReason = string.format("超时跳过 %s（%d 秒没打死）",
+					tostring(verdict.id), math.floor(self.lock._timeout))
+				-- Reported once per couple of seconds: a target that cannot be
+				-- killed is worth saying out loud, but not once per timeout.
+				if now - (self.lastSkipNotice or 0) > 3 then
+					self.lastSkipNotice = now
+					self.notify(string.format("目标 %s %d 秒内没打死，已跳过",
+						tostring(verdict.id), math.floor(self.lock._timeout)), "warn")
+				end
+			end
 			self.locked = nil
 			self.lockTime = 0
 			self.validatedAt = 0
+			self.resized = nil
 		end
 	end
 
 	if self.locked == nil and now - self.scanAt >= SCAN_INTERVAL then
 		self.scanAt = now
-		local target = Combat.select(self)
+		local target = self.select(self)
 		if target ~= nil then
 			self.locked = target
 			self.lockTime = now
 			self.validatedAt = now
 			self.resized = nil
+			--[[
+				The clock is NOT restarted when the same player is re-selected
+				(see TargetLock.lock): a scan that keeps re-picking the same target
+				would otherwise reset the timeout forever, which is precisely the
+				"执着" the timeout exists to end.
+			]]
+			self.lock:lock(target.Name, now)
 		end
 	end
 
 	if self.locked ~= nil then
-		Combat.attack(self, self.locked)
+		self.attack(self, self.locked)
 	end
 end
 
--- The muscle king is published by the game as an ObjectValue or StringValue.
+--[[
+	The muscle king is published by the game as an ObjectValue or StringValue.
+
+	A value that points at nothing usable answers nil rather than a dead
+	instance: "扫描不存在的对象" is what the ObjectValue branch did when the
+	game's cached reference outlived the character it pointed at -- the value's
+	`.Value` stays set (or becomes nil) while the model it named is gone, and the
+	king loop then chased it forever.
+]]
 function Combat.findKing()
 	local shared = ReplicatedStorage:FindFirstChild("shared")
 	local state = shared and shared:FindFirstChild("state")
@@ -9671,10 +10786,21 @@ function Combat.findKing()
 		return nil
 	end
 	if value:IsA("ObjectValue") then
-		return value.Value
+		local pointed = value.Value
+		if pointed == nil or pointed.Parent == nil then
+			return nil
+		end
+		if not pointed:IsA("Player") and not pointed:IsA("Model") then
+			return nil
+		end
+		return pointed
 	end
 	if value:IsA("StringValue") and value.Value ~= "" then
-		return Players:FindFirstChild(value.Value)
+		local found = Players:FindFirstChild(value.Value)
+		if found == nil or found.Parent == nil then
+			return nil
+		end
+		return found
 	end
 	return nil
 end
@@ -9843,23 +10969,40 @@ function Combat.restoreAll(self)
 end
 
 function Combat.stats(self)
+	local now = os.clock()
 	return {
 		punches = self.punches,
 		locked = if self.locked ~= nil then self.locked.Name else nil,
 		kingActive = self.kingActive,
 		lastReason = self.lastReason,
+		--[[
+			The skip read-out. "很多人异常打不到" cannot be answered from the
+			outside: these counts say whether it is the safe zones, the win/lose
+			check or a timeout that is removing people.
+		]]
+		held = self.lock:held(now),
+		timeouts = self.lock._timeouts,
+		skippedCount = self.lock:skipCount(now),
+		skippedIds = self.lock:skippedIds(now),
+		skipStats = self.skipStats,
 	}
 end
 
 function Combat.install(context)
 	local self = Combat.new(context)
 
-	-- Punches are event-driven rather than bursty, but they were previously an
-	-- invisible flood: two sends per frame, unlimited. 60/s is still far beyond
-	-- any real attack rate and it is now counted.
+	--[[
+		Punches are event-driven rather than bursty, and the ORIGINAL 60/s cap was
+		the other half of "出拳速度也太慢了": the kill loop throws two punches per
+		frame (one per hand) and the boss cadence adds its own, so anything above
+		60/s was being refused by the channel's own token bucket -- the limiter,
+		not the game, was setting the punch rate. 400/s with a matching burst
+		leaves the limiter as what it was meant to be (a flood guard for a runaway
+		loop) instead of a ceiling on normal attacking.
+	]]
 	self.net:addChannel("punch", GameNet.senderFor(Remotes.muscle), {
-		rate = 60,
-		burst = 20,
+		rate = 400,
+		burst = 60,
 		queue = 0,
 	})
 
@@ -10101,6 +11244,10 @@ local TOUCH_TAIL = 0.05
 -- See Boss.chestTick: the prompt volume is above the rig, and the legacy offset
 -- of 5 studs sat the character on the hinge line where E usually did nothing.
 local CHEST_STAND_HEIGHT = 15
+-- How long the chest keeps the body after the first successful interaction (see
+-- Boss.chestTick): long enough for the prompt to register, short enough that the
+-- fight is not paused for the rest of the chest timer's 60 s window.
+local CHEST_HOLD = 4
 
 local function selectionOf(store)
 	local selection = {}
@@ -10136,15 +11283,75 @@ end
 	The boss's HP, from wherever this build publishes it.
 
 	The arena holders carry `Health` / `MaxHealth` attributes; an event rig may
-	publish them on the model instead, or expose only a Humanoid. Reading all
-	three keeps the HP line honest instead of printing 0 / 0.
+	publish them on the model instead, a child part, or only expose a Humanoid.
+	Reading all of them keeps the HP line honest instead of printing 0 / 0 -- and
+	the HP is not decoration here: "he is dead, move to the next one" is decided
+	from it (see bossDown).
+
+	The DESCENDANT scan is last and bounded, because a rig that publishes its
+	health somewhere we did not guess is exactly the case that produced "明明血量
+	已经是 0 了，你还在原地等" -- the read came back nil, and nil means "not dead"
+	by design.
 ]]
+local HEALTH_NAMES = { "Health", "health", "HP", "hp", "CurrentHealth", "currentHealth" }
+local HEALTH_SCAN_NODES = 400
+
+local function healthFromAttributes(object)
+	if object == nil then
+		return nil, nil
+	end
+	local ok, health = pcall(function()
+		for _, name in ipairs(HEALTH_NAMES) do
+			local value = tonumber(object:GetAttribute(name))
+			if value ~= nil then
+				return value
+			end
+		end
+		return nil
+	end)
+	if not ok then
+		return nil, nil
+	end
+	local okMax, maxHp = pcall(function()
+		return tonumber(object:GetAttribute("MaxHealth")) or tonumber(object:GetAttribute("maxHealth"))
+	end)
+	return health, if okMax then maxHp else nil
+end
+
+local function healthFromDescendants(holder)
+	if holder == nil then
+		return nil, nil
+	end
+	local scanned = 0
+	local ok, health, maxHp = pcall(function()
+		for _, object in ipairs(holder:GetDescendants()) do
+			scanned += 1
+			if scanned > HEALTH_SCAN_NODES then
+				break
+			end
+			local value, maximum = healthFromAttributes(object)
+			if value == nil and object:IsA("BasePart") then
+				value = nil
+			end
+			if value == nil and object:IsA("ValueBase") then
+				value = tonumber(object.Value)
+			end
+			if value ~= nil then
+				return value, maximum
+			end
+		end
+		return nil, nil
+	end)
+	if not ok then
+		return nil, nil
+	end
+	return health, maxHp
+end
+
 local function readHealth(holder, model)
-	local health = tonumber(holder:GetAttribute("Health"))
-	local maxHp = tonumber(holder:GetAttribute("MaxHealth"))
+	local health, maxHp = healthFromAttributes(holder)
 	if health == nil and model ~= nil and model ~= holder then
-		health = tonumber(model:GetAttribute("Health"))
-		maxHp = tonumber(model:GetAttribute("MaxHealth"))
+		health, maxHp = healthFromAttributes(model)
 	end
 	if health == nil then
 		local humanoid = holder:FindFirstChildWhichIsA("Humanoid", true)
@@ -10154,6 +11361,15 @@ local function readHealth(holder, model)
 		if humanoid ~= nil then
 			health = humanoid.Health
 			maxHp = humanoid.MaxHealth
+		end
+	end
+	if health == nil then
+		-- Last resort, and bounded: see the note above. The model is scanned
+		-- before the holder so a rig that keeps its own health on a part is read
+		-- from there rather than from a stale wrapper attribute.
+		health, maxHp = healthFromDescendants(model)
+		if health == nil and model ~= holder then
+			health, maxHp = healthFromDescendants(holder)
 		end
 	end
 	return health, maxHp
@@ -10244,6 +11460,9 @@ local function bossDown(holder, model): boolean
 		return true
 	end
 	local humanoid = holder:FindFirstChildWhichIsA("Humanoid", true)
+	if humanoid == nil and model ~= nil and model ~= holder then
+		humanoid = model:FindFirstChildWhichIsA("Humanoid", true)
+	end
 	if humanoid ~= nil and humanoid.Health <= 0 then
 		return true
 	end
@@ -10303,13 +11522,37 @@ function Boss.new(context)
 			immediately when the script is closed" half of the same requirement.
 		]]
 		persist = context.persist or nil,
+		--[[
+			Late-bound "is the gym machine holding the body" check. A FUNCTION for
+			the same ordering reason as `sizeRef`: Machine is installed after Boss.
+		]]
+		machineSeated = context.machineSeated or nil,
 		-- Where to put the player back when the boss task turns off.
 		lastPosition = nil,
 		cacheAt = 0,
 		cacheInfo = BossInfo.empty(),
+		-- The rig the current fight is on, so its position and its health can be
+		-- re-read every frame instead of once per DETECT_CACHE (see liveDown).
+		trackedHolder = nil,
+		trackedModel = nil,
 		chest = ChestTimer.new(),
 		lastInteract = 0,
 		loots = 0,
+		--[[
+			The chest claim: true while a chest is READY and the chest task is
+			working on it. `Boss.approach` yields the body while this is up.
+
+			The user's rule is explicit -- "捡宝箱的任务高于打 boss，宝箱是最最尖端
+			的优先级" -- and without the claim the boss task's motion hold rewrites
+			the character's CFrame every frame, so the chest walk can never arrive:
+			the player stands next to the chest, punching an event boss, and the
+			normal boss's chest is never opened.
+		]]
+		chestClaim = false,
+		chestStatus = "idle",
+		-- When the chest was first interacted with, so the claim can be released
+		-- without waiting out the timer's whole window.
+		chestLootedAt = nil,
 		-- Event-boss bookkeeping. See `Boss.hopTick`.
 		eventHolderCache = nil,
 		eventHolderCacheAt = 0,
@@ -10597,6 +11840,11 @@ function Boss.detectEvent(self)
 				-- place rather than removed, and the next boss of the sequence must
 				-- be reached the moment this one dies.
 				if not bossDown(holder, model) then
+					-- Remembered so the fight can re-read this rig's position and
+					-- its health EVERY FRAME instead of living off a 0.5 s old
+					-- snapshot (see Boss.livePosition / Boss.liveDown).
+					self.trackedHolder = holder
+					self.trackedModel = model
 					return fill(
 						BossInfo.empty(),
 						holder,
@@ -10658,6 +11906,8 @@ function Boss.detectNormal(self)
 				local holder = arena:FindFirstChild(entry.id)
 				local model = holder ~= nil and holder:FindFirstChild("Boss") or nil
 				if model ~= nil and not bossDown(holder, model) then
+					self.trackedHolder = holder
+					self.trackedModel = model
 					return fill(
 						BossInfo.empty(),
 						holder,
@@ -10686,6 +11936,8 @@ function Boss.detectNormal(self)
 				if eventKey == nil then
 					local rarity = BossInfo.rarityFromName(holder.Name)
 					if BossInfo.selected(rarity, selection) then
+						self.trackedHolder = holder
+						self.trackedModel = model
 						return fill(
 							BossInfo.empty(),
 							holder,
@@ -10721,6 +11973,10 @@ function Boss.detectNormal(self)
 			info.rarity = rarity
 			info.id = tostring(Workspace:GetAttribute("BossDisplayName") or "?")
 			info.group = BossInfo.NORMAL_GROUP
+			-- No rig to track: this branch exists for a build that publishes the
+			-- fight only as Workspace attributes.
+			self.trackedHolder = nil
+			self.trackedModel = nil
 			return info
 		end
 	end
@@ -10750,7 +12006,60 @@ function Boss.detect(self)
 
 	local chosen = if preferEvent then (event or normal) else (normal or event)
 	self.cacheInfo = chosen or BossInfo.empty()
+	if self.cacheInfo.alive ~= true then
+		-- Nothing is tracked when nothing is alive, so `liveDown` cannot report a
+		-- dead rig from a previous scan as "the current target is dead".
+		self.trackedHolder = nil
+		self.trackedModel = nil
+	end
 	return self.cacheInfo
+end
+
+--[[
+	Throw away the cached detection.
+
+	Used when something makes the answer immediately wrong: the priority switch
+	flipping mid-fight, and a tracked boss dying (see liveDown). Without it the
+	fight keeps acting on a scan that is up to DETECT_CACHE seconds old -- and
+	the user's report is exactly that delay ("明明目标都已经死了，你还在原地等，
+	而不切换目标").
+]]
+function Boss.invalidate(self)
+	self.cacheAt = 0
+end
+
+--[[
+	IS THE *ARENA* GROUP ALIVE?
+
+	Deliberately NOT `Boss.isAlive`, and this is the chest bug the user reported:
+	the chest timer was fed "is any boss alive", so the moment they started
+	fighting an EVENT boss alongside a normal one, the normal boss's death was
+	never observed -- the timer saw "alive" forever and the chest was never
+	opened ("它直接不管宝箱了"). Event bosses drop no chest; only the arena slots
+	do, so only the arena group is what the chest waits on.
+]]
+function Boss.isNormalAlive(self): boolean
+	local info = Boss.detectNormal(self)
+	return info ~= nil and info.alive == true
+end
+
+-- Where the tracked rig is RIGHT NOW, or nil.
+function Boss.livePosition(self)
+	local model = self.trackedModel
+	if model == nil or model.Parent == nil then
+		return nil
+	end
+	return objectPosition(model)
+end
+
+-- [[ Is the tracked rig dead RIGHT NOW? nil when there is nothing to check. ]]
+function Boss.liveDown(self)
+	local holder = self.trackedHolder
+	local model = self.trackedModel
+	if holder == nil or model == nil or holder.Parent == nil or model.Parent == nil then
+		return nil
+	end
+	return bossDown(holder, model)
 end
 
 function Boss.isAlive(self): boolean
@@ -10794,22 +12103,33 @@ local function inHallowedGym(): boolean
 end
 
 local ARENA_REACH = 250
--- How often the hover pose is written directly. The user's number: 0.025 s.
-local PIN_INTERVAL = 0.025
 local TRAVEL_RETRY = 4
 local TRAVEL_ATTEMPT_LIMIT = 3
 --[[
 	THE STAGING POINT, and why the travel is not fired from anywhere.
 
-	The user's sequence is: walk to 283, 19, 372 FIRST, and only then fire
+	The user's sequence is: be at 283, 19, 372 FIRST, and only then fire
 	`areaTravelRemote`. Firing it from wherever the player happens to be does not
 	take (the reported "前往 boss 前并没有按我的要求先传送到我给你的坐标，然后再
 	触发传送门的 Event"), so the staging point is part of the protocol.
+
+	BUT THE COORDINATE IS NOT VERIFIED, and that is the user's own instruction:
+
+	    你应该是到了传送到目标区域后等待零点零点……你要立即触发而不是还要确定
+	    坐标，万一有的时候卡动了呢，你确定坐标根本就确定不了。你直接触发
+	    event 就行了，你传送到我给你的那个点位。
+
+	i.e. snap there, wait one beat, fire. A large character can be *at* the point
+	and still read as "not there" (the root is pushed off the spot by the server,
+	or the snap is rejected), and a gate that waits for the position to agree
+	never opens -- the reported "前往圣诞节健身房时会卡住". So the position is
+	where we PUT the character, not something we require back.
 ]]
 local HALLOWED_STAGING = Vector3.new(283, 19, 372)
 local STAGING_REACH = 25
--- Fast, because the walk to the staging point is a snap now, not a staged path.
-local STAGING_RETRY = 0.5
+-- The beat between the snap and the event: the server has to move the character
+-- before the area travel is accepted, and one frame is not enough.
+local TRAVEL_BEAT = 0.12
 
 -- Are we standing on the staging point?
 function Boss.atStaging(self): boolean
@@ -10853,26 +12173,47 @@ end
 	would stall the whole frame loop (every task, plus the network flush) for a
 	whole network round trip. So it runs in a task.spawn, the same reasoning as
 	Rejoin's blocking HTTP call.
+
+	Returns true when an attempt was actually dispatched (so the caller can count
+	it), which is now "the snap was issued and the event was scheduled" rather
+	than "the character reports itself standing on the mark".
 ]]
 function Boss.requestTravel(self): boolean
 	--[[
-		STEP 1: THE STAGING POINT.
+		STEP 1: PUT THE CHARACTER ON THE MARK.
 
-		Nothing is fired until we are standing on 283, 19, 372; the caller waits a
-		beat and comes back (the retry interval is short while staging).
+		A SNAP, and deliberately not checked afterwards -- see the note on
+		HALLOWED_STAGING. `snap` also cancels any staged walk and any motion hold,
+		which is what stops a big character from being dragged back off the spot
+		while the event is fired.
 	]]
-	if not Boss.goToStaging(self) then
-		return false
+	if self.teleport ~= nil then
+		local ok, position = pcall(function()
+			local root = self.character:requireRoot()
+			return if root ~= nil then root.Position else nil
+		end)
+		if ok and typeof(position) == "Vector3" and (position - HALLOWED_STAGING).Magnitude > 1 then
+			pcall(function()
+				self.teleport:snap(HALLOWED_STAGING)
+			end)
+		end
 	end
 
-	-- STEP 2: the remote.
 	local remote = Remotes.areaTravel()
 	local circle = Remotes.hallowedGymCircle()
 	if remote == nil or circle == nil then
 		self.notify("找不到 areaTravelRemote / hallowedGymCircle，无法自动前往万圣节健身房", "warn")
 		return false
 	end
-	task.spawn(function()
+
+	--[[
+		STEP 2: FIRE THE EVENT, ONE BEAT LATER.
+
+		The beat exists so the server has processed the position before the area
+		travel is asked for; it is scheduled rather than slept through, because
+		this runs inside a scheduler tick.
+	]]
+	local function fire()
 		pcall(function()
 			if remote:IsA("RemoteFunction") then
 				remote:InvokeServer("travelToArea", circle)
@@ -10880,7 +12221,12 @@ function Boss.requestTravel(self): boolean
 				remote:FireServer("travelToArea", circle)
 			end
 		end)
-	end)
+	end
+	if self.timers ~= nil then
+		self.timers:after(os.clock(), TRAVEL_BEAT, fire)
+	else
+		task.spawn(fire)
+	end
 	return true
 end
 
@@ -10926,25 +12272,26 @@ function Boss.ensureArena(self, now, info, position): boolean
 	end
 
 	--[[
-		Two speeds, because there are two phases: getting to the staging point is
-		a snap and may need a beat or two, while waiting out an actual area travel
-		(which teleports the whole server-side character) takes seconds.
+		ONE SPEED NOW, because there is only one phase.
+
+		It used to wait `STAGING_RETRY` until the character reported itself on the
+		mark and only then wait out the long `TRAVEL_RETRY`; the short phase is
+		gone, because the mark is where we PUT the character rather than something
+		we wait to read back (see HALLOWED_STAGING). The rate limit now only keeps
+		the remote from being fired every frame while the game works through a
+		travel that takes a few seconds.
 	]]
-	local staging = Boss.atStaging(self)
-	local wait = if staging then TRAVEL_RETRY else STAGING_RETRY
-	if now - (self.travelAt or 0) < wait then
+	if now - (self.travelAt or 0) < TRAVEL_RETRY then
 		return false
 	end
 	self.travelAt = now
-	if staging then
-		-- Only a fired remote counts against the attempt limit; walks do not.
-		self.travelTries = (self.travelTries or 0) + 1
-	end
 	if self.travelWarned ~= true then
 		self.travelWarned = true
-		self.notify("不在万圣节健身房：先传送到集结点，再触发区域传送", "info")
+		self.notify("不在万圣节健身房：传送到集结点后直接触发区域传送", "info")
 	end
-	Boss.requestTravel(self)
+	if Boss.requestTravel(self) then
+		self.travelTries = (self.travelTries or 0) + 1
+	end
 	return false
 end
 
@@ -11003,9 +12350,120 @@ local function lookBias(store)
 	end
 	return Vector3.new(0, -1, 0)
 end
+
+--[[
+	Let go of the body -- but only if the hold is OURS.
+
+	A hold in mode "boss" was started here; anything else (a chest walk, a
+	teleport, a combat approach, a machine mount) belongs to another subsystem and
+	must not be torn down from this file. `Motion.mode` is the tag every hold
+	carries for exactly this question.
+]]
+function Boss.releaseHold(self): boolean
+	if self.motion == nil then
+		return false
+	end
+	local ok, mode = pcall(function()
+		return self.motion:mode()
+	end)
+	if not ok or mode ~= "boss" then
+		return false
+	end
+	pcall(function()
+		self.motion:finish()
+	end)
+	return true
+end
+
+--[[
+	Is a chest waiting for the body right now?
+
+	True only while the chest task is switched on AND its timer says a chest is
+	ready to be opened -- not while it is merely waiting out `boss.chestDelay`, so
+	the fight keeps going during the delay and yields at the moment the walk
+	starts.
+]]
+function Boss.chestPending(self): boolean
+	return self.store:get("boss.autoChest") == true and self.chestClaim == true
+end
+
+--[[
+	Is the GYM MACHINE holding the body right now?
+
+	A function rather than a value, because Machine is installed AFTER Boss in
+	main.luau -- the same late-binding trap the size service avoids. While this
+	answers true the machine was allowed to own the body (that is what
+	`machine.overridesCombat` means), so the fight must not pin the character off
+	the seat.
+]]
+function Boss.machineHeld(self): boolean
+	local check = self.machineSeated
+	if type(check) ~= "function" then
+		return false
+	end
+	local ok, seated = pcall(check)
+	return ok and seated == true
+end
+
 function Boss.approach(self, now)
 	local info = self.detect(self)
+
+	--[[
+		THE CHEST OUTRANKS THE FIGHT.
+
+		The user's rule: "捡宝箱的任务高于打 boss，宝箱是最最尖端的优先级". A boss
+		fight HOLDS the body (its motion hold rewrites the CFrame every frame), so
+		while a chest is waiting to be looted the fight has to let go of it -- and
+		it has to let go BEFORE it decides anything else, because a normal boss
+		dying while an event boss is up is exactly the reported case ("打完普通
+		boss 掉宝箱，同时我又开始打活动 boss，它直接不管宝箱了").
+	]]
+	if Boss.chestPending(self) then
+		Boss.releaseHold(self)
+		self.approachAt = 0
+		return
+	end
+
+	--[[
+		THE MACHINE, WHEN IT WAS ALLOWED TO WIN.
+
+		`machine.overridesCombat` is the switch that lets the gym machine keep the
+		seat while a fight is running; the fight then has to stand down, because a
+		hover hold sets `PlatformStand` and stands the player up out of the seat
+		(the reported "上完器械后立马又会自己下来").
+	]]
+	if Boss.machineHeld(self) then
+		Boss.releaseHold(self)
+		self.approachAt = 0
+		return
+	end
+
+	--[[
+		NO LIVE TARGET -> LET GO.
+
+		This early return used to leave the hold active, which is why the
+		character stayed frozen on the spot after the boss died ("明明目标都已经
+		死了，你还在原地等") -- and why the chest could not be walked to. Only a
+		hold this subsystem owns is released; a teleport or chest hold belongs to
+		whoever started it.
+	]]
 	if not info.alive or typeof(info.position) ~= "Vector3" then
+		Boss.releaseHold(self)
+		self.approachAt = 0
+		return
+	end
+
+	--[[
+		DEATH IS CHECKED LIVE, not from the 0.5 s old scan.
+
+		The user's report -- "死神血量已经是 0 了，你还在原地等，而不是去尝试切换
+		下一个目标" -- is this delay. One attribute read (plus a Humanoid read) is
+		cheap enough to do every frame, and the moment it says dead the cache is
+		dropped so the NEXT detect returns the next boss of the sequence.
+	]]
+	if Boss.liveDown(self) == true then
+		Boss.invalidate(self)
+		Boss.releaseHold(self)
 		self.approachAt = 0
 		return
 	end
@@ -11032,12 +12490,23 @@ function Boss.approach(self, now)
 		travel remote to move us there and stands down until it lands.
 	]]
 	if info.group == BossInfo.EVENT_GROUP and not Boss.ensureArena(self, now, info, position) then
+		Boss.releaseHold(self)
 		return
 	end
 
+	--[[
+		WHERE THE BOSS IS *NOW*, not where the last scan saw it.
+
+		`info.position` comes from a scan cached for DETECT_CACHE (0.5 s). Pinning
+		to a half-second-old coordinate is why the punch kept missing a boss that
+		walks: the character was being glued to where the boss had been. The
+		tracked rig is re-read on every frame instead.
+	]]
+	local target = Boss.livePosition(self) or info.position
+
 	-- Hover height: close enough for the punches to land, high enough that the
 	-- boss's own attacks mostly miss.
-	local destination = info.position + Vector3.new(0, hoverHeight(self.store, info), 0)
+	local destination = target + Vector3.new(0, hoverHeight(self.store, info), 0)
 
 	--[[
 		PIN THE BODY ON THE BOSS -- NOW, EVERY FRAME.
@@ -11063,21 +12532,22 @@ function Boss.approach(self, now)
 	end
 
 	--[[
-		THE PIN, AT 0.025 s, WITH THE FACING.
+		THE PIN: EVERY FRAME, WITH THE FACING.
 
-		The user's exact requirement: "0.025 秒传送一次，并且同时设置面朝向".
-		This is a direct CFrame write (position + downward-tilted look) issued from
-		the tick, so it does not depend on the hold's verify/retry bookkeeping --
-		which is what still made the hover feel like "0.5 秒一次" whenever a sample
-		or a retry was pending.
+		Was gated to one write per PIN_INTERVAL (0.025 s), which is what the user
+		reported as not holding: "传送间隔太低了，尤其是 boss 的那个锁定面朝向，
+		根本就没有完全锁定住，根本没有把角色的拳头钉在 boss 身上". The hold below
+		already rewrites the pose every RenderStepped, but it carries the hold's
+		verify/retry bookkeeping; this direct write is unconditional, and at one
+		per frame it is strictly tighter than the number that was asked for.
 
-		The hold is armed as well, so between pins the character is still corrected
-		every frame; both write the same pose.
+		Position AND rotation go in the SAME write on purpose: a punch is aimed
+		from the root's CFrame, so a pin that only moved the position would leave
+		the glove pointing where the character happened to be looking.
 	]]
-	if self.teleport ~= nil and self.store:get("boss.directPin") ~= false
-		and now - (self.pinAt or 0) >= PIN_INTERVAL then
+	if self.teleport ~= nil and self.store:get("boss.directPin") ~= false then
 		self.pinAt = now
-		self.teleport:pin(destination, info.position, lookBias(self.store))
+		self.teleport:pin(destination, target, lookBias(self.store))
 	end
 
 	self.motion:setTarget(destination)
@@ -11085,7 +12555,7 @@ function Boss.approach(self, now)
 		self.motion:begin({
 			pos = destination,
 			mode = "boss",
-			look = info.position,
+			look = target,
 			lookBias = lookBias(self.store),
 		})
 	end
@@ -11096,7 +12566,7 @@ function Boss.approach(self, now)
 		`CFrame.lookAt(hoverPos, hoverPos + (flat.Unit + Vector3.new(0,-1,0)).Unit)`
 		is exactly the missing half.
 	]]
-	self.motion:setLook(info.position, lookBias(self.store))
+	self.motion:setLook(target, lookBias(self.store))
 end
 
 --[[
@@ -11212,8 +12682,36 @@ function Boss.chestTick(self, now)
 		delay = tonumber(self.store:get("boss.chestDelay")) or nil,
 	})
 
-	local status = self.chest:observe(Boss.isAlive(self), now)
+	--[[
+		THE CHEST WATCHES THE *ARENA* GROUP, NOT "ANY BOSS".
+
+		This is the reported "打完普通 boss 掉宝箱，同时我又开始打活动 boss，它直接
+		不管宝箱了": `Boss.isAlive` answers "is a boss of EITHER group alive", so
+		the moment an event boss was up the timer saw "alive" forever, the normal
+		boss's death was never observed, and the chest was never opened. Event
+		bosses drop no chest (the user's own words: "活动 boss 是不存在宝箱的"),
+		so only the arena slots are what the timer waits on.
+	]]
+	local status = self.chest:observe(Boss.isNormalAlive(self), now)
+	self.chestStatus = status
 	if status ~= "ready" then
+		self.chestClaim = false
+		-- A fresh death re-arms everything: the next chest is a new chest.
+		self.chestLootedAt = nil
+		return
+	end
+
+	--[[
+		HAND THE BODY BACK ONCE IT IS OPENED.
+
+		The timer keeps saying "ready" for the rest of its window (60 s), and the
+		claim is what makes the fight stand down -- so without this the boss fight
+		would be paused for a minute after every chest. A few seconds is enough
+		for the prompt to register, and the claim is dropped afterwards so the
+		fight resumes while the window is still open.
+	]]
+	if self.chestLootedAt ~= nil and now - self.chestLootedAt > CHEST_HOLD then
+		self.chestClaim = false
 		return
 	end
 
@@ -11230,9 +12728,20 @@ function Boss.chestTick(self, now)
 	end
 	local position = chestPosition(chest, origin)
 	if position == nil or position.Y < -100 then
+		self.chestClaim = false
 		return
 	end
 	local stand = position + Vector3.new(0, CHEST_STAND_HEIGHT, 0)
+
+	--[[
+		THE CLAIM GOES UP BEFORE THE WALK.
+
+		`Boss.approach` yields the body while this is true, so the fight cannot
+		drag the character back off the chest. It is set here (the chest task runs
+		FIRST: priority 430 against the boss's 410) so the boss task in the same
+		frame already sees it.
+	]]
+	self.chestClaim = true
 
 	--[[
 		FALLING SHORT OF THE CHEST COUNTS AS "NOT THERE YET".
@@ -11278,6 +12787,9 @@ function Boss.chestTick(self, now)
 	end
 	self.lastInteract = now
 	Boss.interact(self, chest)
+	-- Stamped on the first interaction so the claim above can be released after
+	-- CHEST_HOLD seconds even though the timer still reports "ready".
+	self.chestLootedAt = self.chestLootedAt or now
 end
 
 --[[
@@ -11469,16 +12981,49 @@ function Boss.install(context)
 		end,
 	})
 
+	--[[
+		THE CHEST OUTRANKS THE FIGHT ("宝箱是最最尖端的优先级").
+
+		Priority 430 puts it above the boss task (410) and above the boss's punch
+		task (385), so on the frame a chest becomes ready the claim in
+		`Boss.chestTick` is already up when `Boss.approach` runs -- and the fight
+		releases the body instead of dragging the character back onto an event boss
+		while the arena boss's chest sits unopened.
+	]]
 	self.scheduler:register({
 		id = "chest",
-		priority = 400,
+		priority = 430,
 		enabled = function()
 			return store:get("boss.autoChest") == true
+		end,
+		onDisable = function()
+			self.chestClaim = false
+			self.chestStatus = "idle"
 		end,
 		tick = function(_dt, now)
 			Boss.chestTick(self, now)
 		end,
 	})
+
+	--[[
+		Changing the priority takes effect NOW.
+
+		`Boss.detect` caches its scan for DETECT_CACHE, so without this the switch
+		looked stuck for up to half a second after being flipped mid-fight -- and
+		the reported symptom is worse than half a second because the OLD target's
+		hold is what the character is sitting under meanwhile. The cache is
+		dropped instead, so the next tick fights whoever the new priority says.
+	]]
+	store:subscribe("boss.priority", function()
+		Boss.invalidate(self)
+	end)
+	-- The same for the two group switches: turning the event bosses off should
+	-- move the fight to the arena immediately, not after a cached scan.
+	for _, path in ipairs({ "boss.event.enabled", "boss.auto" }) do
+		store:subscribe(path, function()
+			Boss.invalidate(self)
+		end)
+	end
 
 	--[[
 		THE POST-EVENT SERVER HOP.
@@ -11740,21 +13285,119 @@ end
 
 	    { Pets = { ["Candy Cube"] = true, ... }, Enabled = <bool>, Auras = {} }
 
-	i.e. a SET of pet names to sell. The preset in the config is a list of
-	`{ name, count }` records (the same shape the pet presets use), and this turns
-	one into the other: names only, so a count in the preset cannot leak into a
-	payload the game would reject.
+	i.e. a SET of pet names to sell, and the set is what the user CHOSE for this
+	crystal: "实际上应该是让我来选择出售哪些宠物，就是该水晶的哪些宠物，并且都是
+	会保留的". Anything not in the set is kept by the game, which is exactly the
+	behaviour asked for -- the old code filled the set with the crystal's entire
+	pool, so "auto sell" meant "sell everything".
 ]]
-function CrystalList.sellSet(preset: { { name: string, count: number? } }?): { [string]: boolean }
+function CrystalList.sellNames(
+	byCrystal: { [string]: any }?,
+	crystal: string?
+): { [string]: boolean }
 	local out: { [string]: boolean } = {}
-	if preset == nil then
+	if byCrystal == nil or crystal == nil or crystal == "" then
 		return out
 	end
-	for _, entry in ipairs(preset) do
-		if type(entry) == "table" and type(entry.name) == "string" and entry.name ~= "" then
-			out[entry.name] = true
+	local entry = byCrystal[crystal]
+	if type(entry) ~= "table" then
+		return out
+	end
+	for name, wanted in pairs(entry) do
+		-- Only names the user ticked: a `false` is "keep", which is the same as
+		-- absent for the payload, and saying so explicitly here means a UI that
+		-- stores `false` cannot accidentally sell a pet.
+		if type(name) == "string" and name ~= "" and wanted == true then
+			out[name] = true
 		end
 	end
+	return out
+end
+
+-- How many pets are selected for one crystal (the UI's read-out).
+function CrystalList.sellCount(byCrystal: { [string]: any }?, crystal: string?): number
+	local sell = CrystalList.sellNames(byCrystal, crystal)
+	local count = 0
+	for _ in pairs(sell) do
+		count += 1
+	end
+	return count
+end
+
+-- [[ Is one pet ticked for this crystal? ]]
+function CrystalList.isMarked(byCrystal: { [string]: any }?, crystal: string?, pet: string?): boolean
+	if byCrystal == nil or crystal == nil or pet == nil then
+		return false
+	end
+	local entry = byCrystal[crystal]
+	if type(entry) ~= "table" then
+		return false
+	end
+	return entry[pet] == true
+end
+
+--[[
+	Set one pet's mark, returning a NEW map.
+
+	Immutable on purpose: the caller writes the result into the store, and the
+	store's "one source of truth" rule is what keeps the checkbox and the payload
+	from disagreeing.
+]]
+function CrystalList.withMark(
+	byCrystal: { [string]: any }?,
+	crystal: string?,
+	pet: string?,
+	marked: boolean
+): { [string]: any }
+	local out: { [string]: any } = {}
+	if byCrystal ~= nil then
+		for rawKey, value in pairs(byCrystal) do
+			local key = tostring(rawKey)
+			local copy: { [string]: boolean } = {}
+			if type(value) == "table" then
+				-- Keys are narrowed with `type(...) == "string"` rather than
+				-- assumed: `pairs` over an `any`-valued table hands the analyzer
+				-- `unknown`, and indexing a `{ [string]: boolean }` with it is a
+				-- type error (the same note appears in CrystalList.parse).
+				for rawName, flag in pairs(value) do
+					if type(rawName) == "string" then
+						copy[rawName] = flag == true
+					end
+				end
+			end
+			out[key] = copy
+		end
+	end
+	if crystal == nil or crystal == "" or pet == nil or pet == "" then
+		return out
+	end
+	local entry = out[crystal]
+	if type(entry) ~= "table" then
+		entry = {}
+		out[crystal] = entry
+	end
+	entry[pet] = marked == true
+	return out
+end
+
+-- [[ Mark every pet of `pool` at once (全选 / 全不选). ]]
+function CrystalList.withPoolMark(
+	byCrystal: { [string]: any }?,
+	crystal: string?,
+	pool: { string }?,
+	marked: boolean
+): { [string]: any }
+	local out = CrystalList.withMark(byCrystal, crystal, nil, false)
+	if crystal == nil or crystal == "" or pool == nil then
+		return out
+	end
+	local entry: { [string]: boolean } = {}
+	for _, pet in ipairs(pool) do
+		if type(pet) == "string" and pet ~= "" then
+			entry[pet] = marked == true
+		end
+	end
+	out[crystal] = entry
 	return out
 end
 
@@ -12008,8 +13651,8 @@ function Crystals.applyAutoSell(self): boolean
 	if remote == nil or type(name) ~= "string" or name == "" then
 		return false
 	end
-	local preset = self.store:get("crystal.sellPets")
-	local sell = CrystalList.sellSet(preset)
+	-- The set the USER ticked for this crystal; everything else is kept.
+	local sell = CrystalList.sellNames(self.store:get("crystal.sellByCrystal"), name)
 	local payload = CrystalList.sellPayload(sell, self.store:get("crystal.autoSell") == true)
 
 	task.spawn(function()
@@ -12021,19 +13664,55 @@ function Crystals.applyAutoSell(self): boolean
 	return true
 end
 
--- Mark every pet of the selected crystal's pool as sellable.
-function Crystals.fillSellFromPool(self): number
+-- The pets ticked for the selected crystal (for the page's checkboxes).
+function Crystals.sellSelection(self)
+	local name = self.store:get("crystal.selected")
+	return CrystalList.sellNames(
+		self.store:get("crystal.sellByCrystal"),
+		if type(name) == "string" then name else nil
+	)
+end
+
+--[[
+	Tick / untick ONE pet of the selected crystal.
+
+	The store write is the whole action: the page's checkbox is bound to the same
+	map, so it repaints from the change rather than keeping its own copy.
+]]
+function Crystals.setSell(self, pet: string?, marked: boolean)
+	local name = self.store:get("crystal.selected")
+	if type(name) ~= "string" or name == "" then
+		self.notify("先选一个水晶", "warn")
+		return
+	end
+	self.store:set("crystal.sellByCrystal",
+		CrystalList.withMark(self.store:get("crystal.sellByCrystal"), name, pet, marked))
+end
+
+-- Mark the whole pool of the selected crystal (全选 / 全不选).
+function Crystals.setPoolSell(self, marked: boolean): number
+	local name = self.store:get("crystal.selected")
+	if type(name) ~= "string" or name == "" then
+		self.notify("先选一个水晶", "warn")
+		return 0
+	end
 	local pool = Crystals.selectedPool(self)
 	if #pool == 0 then
 		self.notify("读不到该水晶的宠物池（crystalChances）", "warn")
 		return 0
 	end
-	local preset = {}
-	for _, pet in ipairs(pool) do
-		table.insert(preset, { name = pet, count = 1 })
-	end
-	self.store:set("crystal.sellPets", preset)
-	return #preset
+	self.store:set("crystal.sellByCrystal",
+		CrystalList.withPoolMark(self.store:get("crystal.sellByCrystal"), name, pool, marked))
+	return #pool
+end
+
+-- How many pets of the selected crystal are marked for selling.
+function Crystals.sellCount(self): number
+	local name = self.store:get("crystal.selected")
+	return CrystalList.sellCount(
+		self.store:get("crystal.sellByCrystal"),
+		if type(name) == "string" then name else nil
+	)
 end
 
 function Crystals.stats(self)
@@ -12107,7 +13786,7 @@ function Crystals.install(context)
 		end)
 	end
 
-	for _, path in ipairs({ "crystal.autoSell", "crystal.sellPets", "crystal.selected" }) do
+	for _, path in ipairs({ "crystal.autoSell", "crystal.sellByCrystal", "crystal.selected" }) do
 		store:subscribe(path, scheduleApply)
 	end
 
@@ -12472,6 +14151,9 @@ function Machine.new(context)
 		target = nil,
 		attempts = 0,
 		lastPhase = "idle",
+		-- The reason the machine is standing down right now, kept for the page
+		-- even when `blockedState` stops reporting one (see Machine.stats).
+		blockReason = nil,
 		placeAt = nil,
 		sendAt = nil,
 		seatSince = nil,
@@ -12711,10 +14393,64 @@ local function mountSeat(self, root, humanoid, seat, now)
 	end
 end
 
+--[[
+	IS THE PLAYER ON A MACHINE RIGHT NOW?
+
+	Used by the fight subsystems: while this is true the machine was ALLOWED to
+	own the body (i.e. `machine.overridesCombat` is what let it mount), so the
+	boss hover and the combat approach must not hold the character -- a motion
+	hold sets `PlatformStand`, which breaks the seat's weld and is exactly the
+	reported "他在上完器械后立马又会自己下来".
+]]
+function Machine.isSeated(self): boolean
+	if self.lastPhase ~= "mounted" then
+		return false
+	end
+	local humanoid = self.character:humanoid()
+	if humanoid == nil then
+		return false
+	end
+	if humanoid.Sit == true then
+		return true
+	end
+	-- `Sit` can be false for a frame while the seat re-welds; the occupant check
+	-- is the second opinion, and it only asks it on an actual Seat.
+	local seat = if self.target ~= nil then self.target.seat else nil
+	return occupantOf(seat) == humanoid
+end
+
 function Machine.tick(self, now)
 	local humanoid = self.character:humanoid()
 	local root = self.character:requireRoot()
 	local hasCharacter = humanoid ~= nil and root ~= nil
+
+	--[[
+		THE BLOCK, HANDLED HERE OR NOT AT ALL.
+
+		This is the reported thrash: the fight's motion hold sets `PlatformStand`,
+		which stands the character up out of the seat -- and because nothing in
+		this tick ever asked whether the machine was ALLOWED to be used, the next
+		tick saw "not seated", re-mounted, got stood up again, and repeated until
+		the 4 s seat timeout moved it to another machine. "上完器械后立马又会自己
+		下来，或者说干脆不上器械，逻辑会卡住" is that loop.
+
+		So being blocked is a STATE: dismount once, then stay off until the reason
+		goes away. `blockedState` is re-asked every tick, so the mount resumes by
+		itself the moment nothing needs the body.
+	]]
+	local blocked, reason = Machine.blockedState(self)
+	self.blockReason = reason
+	if blocked then
+		if self.lastPhase ~= "blocked" then
+			-- One dismount per block, never one per tick.
+			if self.lastPhase == "mounted" or self.lastPhase == "mounting" then
+				Machine.dismount(self)
+			end
+			self.lastPhase = "blocked"
+			self.target = nil
+		end
+		return
+	end
 
 	--[[
 		`self.target` IS A SEAT RECORD ({ model, seat, name, gym, index }), NOT A
@@ -12743,6 +14479,10 @@ function Machine.tick(self, now)
 
 	local target = self.target
 	if not hasCharacter or target == nil then
+		if self.lastPhase == "blocked" then
+			return
+		end
+		self.lastPhase = "idle"
 		return
 	end
 
@@ -12807,7 +14547,9 @@ function Machine.stats(self)
 		target = if self.target ~= nil then self.target.name else nil,
 		seats = #Machine.seats(self),
 		blocked = blocked,
-		reason = reason,
+		-- The LIVE reason, not the one remembered when the block started: the
+		-- page prints this to answer "启用了器械为什么不上".
+		reason = reason or self.blockReason,
 	}
 end
 
@@ -12841,49 +14583,6 @@ function Machine.install(context)
 end
 
 return Machine
-end
-
-__modules["game/PlayerStats"] = function()
--- (module directive --!nonstrict; the bundle is --!nonstrict)
---[[
-	PlayerStats -- reading the leaderboard values.
-
-	V1007's Core.stat looked in two places: a direct child, then leaderstats. The
-	direct-child lookup is nearly always a miss (the game keeps these under
-	leaderstats), but it is kept because it costs one failed lookup and some
-	versions expose them flat.
-]]
-
-local PlayerStats = {}
-
-function PlayerStats.value(player, name): number
-	if player == nil or name == nil then
-		return 0
-	end
-	local direct = player:FindFirstChild(name)
-	if direct ~= nil and direct:IsA("ValueBase") then
-		return tonumber(direct.Value) or 0
-	end
-	local leaderstats = player:FindFirstChild("leaderstats")
-	if leaderstats ~= nil then
-		local value = leaderstats:FindFirstChild(name)
-		if value ~= nil and value:IsA("ValueBase") then
-			return tonumber(value.Value) or 0
-		end
-	end
-	return 0
-end
-
-function PlayerStats.snapshot(player)
-	return {
-		strength = PlayerStats.value(player, "Strength"),
-		rebirths = PlayerStats.value(player, "Rebirths"),
-		gems = PlayerStats.value(player, "Gems"),
-		durability = PlayerStats.value(player, "Durability"),
-	}
-end
-
-return PlayerStats
 end
 
 __modules["game/Rebirth"] = function()
@@ -13453,6 +15152,8 @@ Follow.__index = Follow
 	    "resolve" ask "where is he" (the caller owns the HTTP lookup)
 	    "wait"    keep waiting: not ready, busy, throttled, or he is not in game
 	    "join"    go to `jobId`, now
+	    "sweep"   the lookup cannot say where he is -- walk the public server
+	              list one server at a time until he is found
 	    "stop"    give up for this session (attempts or wait exhausted)
 ]]
 Follow.IDLE = "idle"
@@ -13460,6 +15161,7 @@ Follow.WATCH = "watch"
 Follow.RESOLVE = "resolve"
 Follow.WAIT = "wait"
 Follow.JOIN = "join"
+Follow.SWEEP = "sweep"
 Follow.STOP = "stop"
 
 --[[
@@ -13485,12 +15187,37 @@ Follow.DEFAULT_POLL = 10
 Follow.DEFAULT_GAP = 30
 Follow.DEFAULT_WAIT = 600
 Follow.DEFAULT_ATTEMPTS = 4
+--[[
+	How long between two SWEEP hops.
+
+	Deliberately much shorter than `waitSeconds` -- a sweep is "try the next
+	server", and each hop is a whole session change, so it has to be paced by
+	something. 20 s is long enough for the join verdict (HOP_TIMEOUT, 20 s) to
+	come back, and short enough that a sweep across a hundred servers finishes in
+	a session or two.
+]]
+Follow.DEFAULT_SWEEP_GAP = 20
 
 export type Options = {
 	poll: number?,
 	gap: number?,
 	waitSeconds: number?,
 	maxAttempts: number?,
+	--[[
+		THE SWEEP ("一直尝试"), on by default.
+
+		The presence lookup is the only way to learn WHICH server the target is
+		on, and it can legitimately come back with nothing: the player hides his
+		online status, the executor's HTTP is unavailable, or the API answers a
+		shape this build does not recognise. When that happens the follow must not
+		sit still -- the user's instruction is "就是要一直尝试，并且你要用有效的，
+		我发现之前的根本就无效". So instead of waiting, the caller walks the public
+		server list one server at a time; the target is found the moment a hop
+		lands on him, because being in the same server is observable without any
+		API at all.
+	]]
+	sweep: boolean?,
+	sweepGap: number?,
 }
 
 export type Observation = {
@@ -13507,6 +15234,9 @@ export type Observation = {
 	busy: boolean,
 	-- A lookup is in flight; do not ask for another one.
 	lookupInFlight: boolean,
+	-- May the caller start a server sweep, and is it past its own throttle?
+	sweep: boolean?,
+	sweepReady: boolean?,
 	now: number,
 }
 
@@ -13528,6 +15258,8 @@ export type Follow = {
 	_gap: number,
 	_wait: number,
 	_maxAttempts: number,
+	_sweep: boolean,
+	_sweepGap: number,
 	-- He has been seen in this server at least once during this follow.
 	_seen: boolean,
 	-- When he was first observed to be absent; nil while he is here.
@@ -13539,8 +15271,9 @@ export type Follow = {
 	_result: Result?,
 	-- The last decision, for the UI read-out.
 	_last: Decision,
-	-- How many steps returned "resolve" (diagnostics).
+	-- How many steps returned "resolve" / "sweep" (diagnostics).
 	_lookups: number,
+	_sweeps: number,
 }
 
 local function clampNumber(value: number?, fallback: number, low: number, high: number): number
@@ -13569,6 +15302,8 @@ function Follow.new(options: Options?): Follow
 		_gap = clampNumber(opts.gap, Follow.DEFAULT_GAP, 1, 3600),
 		_wait = clampNumber(opts.waitSeconds, Follow.DEFAULT_WAIT, 1, 86400),
 		_maxAttempts = math.floor(clampNumber(opts.maxAttempts, Follow.DEFAULT_ATTEMPTS, 1, 100)),
+		_sweep = opts.sweep ~= false,
+		_sweepGap = clampNumber(opts.sweepGap, Follow.DEFAULT_SWEEP_GAP, 1, 3600),
 		_seen = false,
 		_missingAt = nil,
 		_attempts = 0,
@@ -13576,6 +15311,7 @@ function Follow.new(options: Options?): Follow
 		_result = nil,
 		_last = { action = Follow.IDLE, jobId = nil, reason = "未启用" },
 		_lookups = 0,
+		_sweeps = 0,
 	}, Follow)
 	return (self :: any) :: Follow
 end
@@ -13589,6 +15325,10 @@ function Follow.configure(self: Follow, options: Options?)
 	self._gap = clampNumber(opts.gap, self._gap, 1, 3600)
 	self._wait = clampNumber(opts.waitSeconds, self._wait, 1, 86400)
 	self._maxAttempts = math.floor(clampNumber(opts.maxAttempts, self._maxAttempts, 1, 100))
+	if opts.sweep ~= nil then
+		self._sweep = opts.sweep ~= false
+	end
+	self._sweepGap = clampNumber(opts.sweepGap, self._sweepGap, 1, 3600)
 end
 
 -- Forget everything. Switching the feature off (or unconfiguring the target)
@@ -13618,6 +15358,9 @@ local function missReason(status: string, target: string?): string
 	local who = tostring(target or "目标玩家")
 	if status == "no-http" then
 		return string.format("查不到 %s：当前执行器没有可用的 HTTP 接口", who)
+	end
+	if status == "no-list" then
+		return string.format("扫描换服失败：拿不到 %s 所在游戏的服务器列表", who)
 	end
 	if status == "other-place" then
 		return string.format("%s 在同一个游戏的其他地点，无法跟随", who)
@@ -13692,13 +15435,25 @@ function Follow.step(self: Follow, obs: Observation): Decision
 	if obs.busy == true then
 		return verdict(self, Follow.WAIT, nil, "已有重进正在进行")
 	end
-	if self._attempts >= self._maxAttempts then
-		return verdict(self, Follow.STOP, nil,
-			string.format("已尝试 %d 次仍进不去 %s 的服务器（多半满员）", self._attempts, tostring(target)))
-	end
-	if waited > self._wait then
-		return verdict(self, Follow.STOP, nil,
-			string.format("等待 %s 上线超过 %d 秒，已停止跟随", tostring(target), math.floor(self._wait)))
+	--[[
+		The SWEEP bypasses both give-ups.
+
+		The attempt budget and the wait limit exist for the "he is on a specific
+		server and we cannot get in" case. A sweep is a different strategy: it
+		walks the server list until the target is physically found, so stopping it
+		after four tries or ten minutes is exactly the "根本无效" the user
+		reported. It has its own pace (`sweepGap`) and its own switch instead.
+	]]
+	local sweeping = obs.sweep == true and self._sweep == true
+	if not sweeping then
+		if self._attempts >= self._maxAttempts then
+			return verdict(self, Follow.STOP, nil,
+				string.format("已尝试 %d 次仍进不去 %s 的服务器（多半满员）", self._attempts, tostring(target)))
+		end
+		if waited > self._wait then
+			return verdict(self, Follow.STOP, nil,
+				string.format("等待 %s 上线超过 %d 秒，已停止跟随", tostring(target), math.floor(self._wait)))
+		end
 	end
 	if self._joinedAt > 0 and now - self._joinedAt < self._gap then
 		return verdict(self, Follow.WAIT, nil, "距离上次尝试不久，稍后重试")
@@ -13708,6 +15463,16 @@ function Follow.step(self: Follow, obs: Observation): Decision
 	if result ~= nil and now - result.at < self._poll then
 		-- A fresh answer: act on it.
 		if result.jobId == nil or result.jobId == "" then
+			-- No destination from the lookup. With the sweep available this is
+			-- the moment to start walking the server list, not to sit and wait.
+			if sweeping then
+				if obs.sweepReady ~= true then
+					return verdict(self, Follow.WAIT, nil, "扫描换服：等待下一次尝试")
+				end
+				self._sweeps += 1
+				return verdict(self, Follow.SWEEP, nil,
+					string.format("查不到 %s 的位置，扫描下一个服务器", tostring(target)))
+			end
 			return verdict(self, Follow.WAIT, nil, missReason(result.status, target))
 		end
 		if result.jobId == obs.currentJobId then
@@ -13753,6 +15518,9 @@ export type Status = {
 	resultStatus: string?,
 	poll: number,
 	gap: number,
+	sweep: boolean,
+	sweepGap: number,
+	sweeps: number,
 }
 
 function Follow.status(self: Follow, now: number): Status
@@ -13777,6 +15545,9 @@ function Follow.status(self: Follow, now: number): Status
 		resultStatus = if result ~= nil then result.status else nil,
 		poll = self._poll,
 		gap = self._gap,
+		sweep = self._sweep,
+		sweepGap = self._sweepGap,
+		sweeps = self._sweeps,
 	}
 end
 
@@ -13884,53 +15655,107 @@ function Rejoin.new(context)
 		followLookup = false,
 		followAt = 0,
 		followAction = nil,
+		--[[
+			The sweep's own bookkeeping: one list fetch at a time, when this
+			session last started a sweep hop (the cross-session stamp lives in the
+			config, because a hop ends the session), and whether the last attempt
+			could not even get a server list.
+		]]
+		sweepLookup = false,
+		sweepAt = 0,
+		sweepFailed = false,
 	}, Rejoin)
 	return self
 end
 
 --[[
-	The executor's HTTP function, if it has one.
+	The executor's HTTP functionS, if it has any.
 
-	Probed in one place because TWO callers need the same answer: `httpRequest`
-	(which needs the function) and the player lookup (which needs to know whether
-	a POST was even possible, so it can say "this executor cannot look players up"
+	Probed as a LIST because two callers need the same answer: `httpRequest`
+	(which needs a function) and the player lookup (which needs to know whether a
+	POST was even possible, so it can say "this executor cannot look players up"
 	instead of reporting a nonexistent user as offline).
+
+	A list, and not a single `or` chain, because the handlers are not
+	interchangeable: `syn.request` / `request` / `http_request` are the common
+	ones and a script that only picks the first non-nil can end up with a
+	half-implemented shim. Each candidate is tried in turn.
 ]]
-local function httpExecutor()
-	return (type(syn) == "table" and syn.request)
-		or (type(http) == "table" and http.request)
-		or (type(fluxus) == "table" and fluxus.request)
-		or request
-		or http_request
+local function httpExecutors()
+	local out = {}
+	local function add(candidate)
+		if type(candidate) == "function" then
+			table.insert(out, candidate)
+		end
+	end
+	if type(syn) == "table" then
+		add(syn.request)
+	end
+	if type(http) == "table" then
+		add(http.request)
+	end
+	if type(fluxus) == "table" then
+		add(fluxus.request)
+	end
+	add(request)
+	add(http_request)
+	return out
 end
 
+--[[
+	One HTTP call, across every shape of executor.
+
+	THE TWO KEY CASINGS MATTER, and this is very likely why the player lookup
+	"就是没法获取到" on the user's executor: the widely-used `request` shim takes
+	LOWERCASE keys (`url`, `method`, `body`, `headers`) while `syn.request` and
+	most others take them capitalised. A handler that is handed the wrong casing
+	does not raise -- it returns nil or an empty body, which the old code reported
+	as "the player is not there".
+
+	Returns (body, status) where status is the HTTP status code when the executor
+	reports one.
+]]
 local function httpRequest(url, method, body, contentType)
-	local executor = httpExecutor()
-	if type(executor) == "function" then
-		local ok, response = pcall(executor, {
-			Url = url,
-			Method = method or "GET",
-			Body = body,
-			Headers = if body ~= nil
-				then { ["Content-Type"] = contentType or "application/json" }
-				else nil,
-		})
-		if ok and type(response) == "table" then
-			return response.Body or response.body
-		end
-		return nil
-	end
-	if method == nil or method == "GET" then
-		if type(game.HttpGet) == "function" then
-			local ok, text = pcall(function()
-				return game:HttpGet(url)
-			end)
-			if ok then
-				return text
+	local verb = method or "GET"
+	local headers = if body ~= nil
+		then { ["Content-Type"] = contentType or "application/json" }
+		else nil
+
+	for _, executor in ipairs(httpExecutors()) do
+		-- Capitalised first (the documented shape), then lowercase (the `request`
+		-- shim's shape).
+		local shapes = {
+			{ Url = url, Method = verb, Body = body, Headers = headers },
+			{ url = url, method = verb, body = body, headers = headers },
+		}
+		for _, payload in ipairs(shapes) do
+			local ok, response = pcall(executor, payload)
+			if ok and type(response) == "table" then
+				local text = response.Body or response.body
+				if type(text) == "string" and text ~= "" then
+					local status = tonumber(response.StatusCode) or tonumber(response.status) or tonumber(response.Status)
+					return text, status
+				end
 			end
 		end
 	end
-	return nil
+
+	if verb == "GET" then
+		-- `game:HttpGet` is a real Roblox global and works without any executor
+		-- at all, so it is worth trying LAST rather than instead.
+		for _, name in ipairs({ "HttpGetAsync", "HttpGet" }) do
+			local fetch = game[name]
+			if type(fetch) == "function" then
+				local ok, text = pcall(function()
+					return fetch(game, url)
+				end)
+				if ok and type(text) == "string" and text ~= "" then
+					return text, nil
+				end
+			end
+		end
+	end
+	return nil, nil
 end
 
 local function httpGet(url)
@@ -14060,7 +15885,7 @@ local function lookupPlayerJob(name)
 		end
 	end
 	if userId == nil then
-		if type(httpExecutor()) ~= "function" then
+		if #httpExecutors() == 0 then
 			return nil, "no-http"
 		end
 		return nil, "unknown"
@@ -14509,6 +16334,57 @@ function Rejoin.spawnFollowLookup(self, name)
 end
 
 --[[
+	START A SWEEP HOP: "we cannot learn where he is, so go and look".
+
+	This is the fallback the user asked for by name -- "就是要一直尝试，并且你要用
+	有效的，我发现之前的根本就无效". It does not need the presence API at all:
+
+	    fetch the public server list for this place (GET, works everywhere)
+	    take the server at the persisted cursor
+	    hop there -- and the NEXT session simply asks "is he here?" again
+
+	`Players:FindFirstChild` is the whole detection, so a hop that lands on him
+	succeeds with no API involved, and a hop that does not land on him tells the
+	next session to try the following server. The cursor and the timestamp are in
+	the config because a hop ENDS the session -- in-session state cannot survive
+	it, and a sweep that restarts from the first server every time would never
+	get past it.
+]]
+function Rejoin.spawnSweep(self)
+	if self.sweepLookup == true then
+		return false
+	end
+	self.sweepLookup = true
+	task.spawn(function()
+		local ok, list = pcall(Rejoin.fetchServers, self, "Asc")
+		self.sweepLookup = false
+		if not ok or type(list) ~= "table" or #list == 0 then
+			-- No list means no sweep: report it as a failed lookup so the
+			-- decision falls back to waiting (and the page says why).
+			self.follow:remember(nil, os.clock(), "no-list")
+			self.sweepFailed = true
+			return
+		end
+		local cursor = tonumber(self.store:get("follow.sweepCursor")) or 0
+		local index = (cursor % #list) + 1
+		local server = list[index]
+		if type(server) ~= "table" or type(server.id) ~= "string" or server.id == "" then
+			self.follow:remember(nil, os.clock(), "no-list")
+			self.sweepFailed = true
+			return
+		end
+		-- Written BEFORE the hop: the session is about to end, and the next one
+		-- must continue where this one stopped.
+		self.store:set("follow.sweepCursor", (cursor + 1) % 1000000)
+		self.store:set("follow.sweepAt", os.time())
+		self.sweepFailed = false
+		self.notify(string.format("跟随：扫描服务器 %d/%d", index, #list), "info")
+		Rejoin.beginUrgent(self, "跟随：扫描下一个服务器", "follow", server.id)
+	end)
+	return true
+end
+
+--[[
 	One step of 跟随玩家.
 
 	Returns the decision core/Follow made, which is also what the settings page
@@ -14529,7 +16405,23 @@ function Rejoin.followTick(self, now)
 		gap = tonumber(store:get("follow.gap")),
 		waitSeconds = tonumber(store:get("follow.waitSeconds")),
 		maxAttempts = tonumber(store:get("follow.maxAttempts")),
+		sweep = store:get("follow.sweep") ~= false,
+		sweepGap = tonumber(store:get("follow.sweepGap")),
 	})
+
+	--[[
+		The sweep's throttle, across sessions.
+
+		`follow.sweepAt` is the wall-clock stamp of the last sweep hop -- it has to
+		be persisted, because each hop is a new session and an in-session stamp
+		would let a sweep hop once per second. A zero stamp means "never swept",
+		which is ready by definition (that is also what makes the sweep testable
+		in the smoke harness, where the wall clock is frozen).
+	]]
+	local sweepGap = tonumber(store:get("follow.sweepGap")) or 20
+	local stamp = tonumber(store:get("follow.sweepAt")) or 0
+	local crossSessionReady = stamp == 0 or (os.time() - stamp) >= sweepGap
+	local sameSessionReady = now - (self.sweepAt or 0) >= sweepGap
 
 	local target = store:get("rejoin.targetPlayer")
 	local decision = self.follow:step({
@@ -14542,7 +16434,9 @@ function Rejoin.followTick(self, now)
 		-- mixing the two made the grace unmeasurable in a stubbed run.
 		ready = (now - self.startedAt) >= STARTUP_GRACE,
 		busy = self._triggered or self._state ~= "idle",
-		lookupInFlight = self.followLookup == true,
+		lookupInFlight = self.followLookup == true or self.sweepLookup == true,
+		sweep = store:get("follow.sweep") ~= false,
+		sweepReady = crossSessionReady and sameSessionReady,
 		now = now,
 	})
 
@@ -14551,6 +16445,9 @@ function Rejoin.followTick(self, now)
 
 	if decision.action == Follow.RESOLVE then
 		Rejoin.spawnFollowLookup(self, target)
+	elseif decision.action == Follow.SWEEP then
+		self.sweepAt = now
+		Rejoin.spawnSweep(self)
 	elseif decision.action == Follow.JOIN then
 		-- URGENT, with no countdown: "立刻加入" is the whole point of the
 		-- feature, and the target's server is only reachable while he is in it.
@@ -14584,6 +16481,11 @@ function Rejoin.followStatus(self)
 		targetJobId = status.jobId,
 		lookupInFlight = self.followLookup == true,
 		busy = self._triggered or self._state ~= "idle",
+		sweep = status.sweep,
+		sweepGap = status.sweepGap,
+		sweeps = status.sweeps,
+		sweepCursor = tonumber(self.store:get("follow.sweepCursor")) or 0,
+		sweepFailed = self.sweepFailed == true,
 	}
 end
 
@@ -15893,7 +17795,9 @@ function Train.install(context)
 			return true
 		end,
 		tick = function(_dt, now)
-			if now - lastAttempt < 0.12 then
+			-- 0.05 s rather than 0.12: the tool task only runs OUTSIDE the dual
+			-- arbiter, and the user's report is about how long a swap takes.
+			if now - lastAttempt < 0.05 then
 				return
 			end
 			lastAttempt = now
@@ -15992,7 +17896,15 @@ function Train.install(context)
 			setDualMode("punch", os.clock())
 		end,
 		tick = function(_dt, now)
-			if now - dualAssertAt < 0.08 then
+			--[[
+				The re-assert rate, and part of the reported "工具的交替太慢了".
+
+				Was 0.08 s, which on a 0.25 s dwell is a third of the window: the
+				swap itself could be delayed by up to 80 ms on either side. 0.03 s
+				is still slower than a frame and keeps the hand where the dwell
+				says it should be.
+			]]
+			if now - dualAssertAt < 0.03 then
 				return
 			end
 			dualAssertAt = now
@@ -16003,7 +17915,7 @@ function Train.install(context)
 				return
 			end
 			local player = Players.LocalPlayer
-			local dwell = math.max(0.1, tonumber(store:get("kill.dualInterval")) or 0.6)
+			local dwell = math.max(0.1, tonumber(store:get("kill.dualInterval")) or 0.25)
 
 			if dualMode == "train" then
 				local groups = toolGroups()
@@ -18958,6 +20870,28 @@ end
 	The mouse delta is divided by the window's scale, which the shell knows
 	because the shell set it.
 ]]
+--[[
+	Does an OVERLAY (the info panel) own this screen point right now?
+
+	The panel floats over the main window, and Roblox's own input routing cannot
+	answer this for us: the panel is a SIBLING of the main frame, and a press that
+	lands on one of its non-Active children (a label, the read-out list) never
+	reaches the panel's own drag handler -- but it does reach the main window's
+	title bar underneath. The reported symptom is exactly that: "如果实时信息面
+	板与主面板的标题栏重叠，我拖动它会同时拖动主面板，这是点击穿透问题".
+
+	`main.luau` installs the predicate (the shell does not own the panel); a
+	missing one means nothing is layered over the window.
+]]
+function Shell.overlayTakes(self, position): boolean
+	local check = self.isOverlayAt
+	if type(check) ~= "function" or position == nil then
+		return false
+	end
+	local ok, taken = pcall(check, position.X, position.Y)
+	return ok and taken == true
+end
+
 function Shell.bindDrag(self, handle)
 	local dragging = false
 	local startInput = nil
@@ -18971,6 +20905,10 @@ function Shell.bindDrag(self, handle)
 		local position = handle.AbsolutePosition
 		local size = handle.AbsoluteSize
 		if input.Position.X >= position.X + size.X - TOP_BUTTON_ZONE then
+			return
+		end
+		-- The panel above wins the cursor: see Shell.overlayTakes.
+		if Shell.overlayTakes(self, input.Position) then
 			return
 		end
 		dragging = true
@@ -21192,6 +23130,66 @@ end
 end
 
 --[[
+	The screen, but only when it can be trusted.
+
+	`screenSize` falls back to 1920x1080 when there is no camera. During a rejoin
+	the camera can genuinely be nil for a moment, and placing a panel against a
+	GUESSED 1920x1080 screen is how it ended up off-screen on a smaller display
+	("有概率的时候我重进游戏，那个实时信息面板它老是飘到屏幕外去"). So the fallback
+	is only used while the panel is being BUILT; once it exists, a missing camera
+	means "keep the position you have".
+]]
+local function usableScreen(self)
+	local viewport = nil
+	if self.shell ~= nil and self.shell.viewport ~= nil then
+		local ok, value = pcall(function()
+			return self.shell:viewport()
+		end)
+		if ok and value ~= nil then
+			viewport = value
+		end
+	end
+	if viewport == nil then
+		return nil
+	end
+	if type(viewport.X) ~= "number" or type(viewport.Y) ~= "number" then
+		return nil
+	end
+	return viewport
+end
+
+--[[
+	Is this screen point inside the panel?
+
+	The shell asks before starting a drag of the MAIN window, because the panel
+	floats over it: a press that lands on the panel must move the panel, not both
+	("如果实时信息面板与主面板的标题栏重叠，拖动它会同时拖动主面板，这是点击穿透
+	问题"). Roblox input routing alone cannot answer this reliably here -- the
+	panel is a sibling of the main frame, and a press inside a non-Active child
+	never reaches the panel's own handler.
+]]
+function InfoWindow.overRect(self, x, y): boolean
+	local frame = self.frame
+	if frame == nil or frame.Visible ~= true then
+		return false
+	end
+	local okPosition, position = pcall(function()
+		return frame.AbsolutePosition
+	end)
+	local okSize, size = pcall(function()
+		return frame.AbsoluteSize
+	end)
+	if not okPosition or not okSize then
+		return false
+	end
+	if type(x) ~= "number" or type(y) ~= "number" then
+		return false
+	end
+	return x >= position.X and x <= position.X + size.X
+		and y >= position.Y and y <= position.Y + size.Y
+end
+
+--[[
 	Put the panel somewhere that does not cover the main window.
 
 	The decision is core/PanelPlacement; this only gathers the rectangles.
@@ -21206,7 +23204,12 @@ end
 	store and the computed size, so the answer is the same every session.
 ]]
 function InfoWindow.place(self)
-	local screen = screenSize()
+	local screen = usableScreen(self)
+	if screen == nil then
+		-- No trustworthy screen: keep the panel where it is rather than pushing
+		-- it to a coordinate computed from a guessed viewport.
+		return nil
+	end
 	local main = self.shell.main
 	local mainRect = nil
 	if main ~= nil and main.Visible and not self.shell.pill then
@@ -21237,6 +23240,19 @@ function InfoWindow.place(self)
 
 	self.frame.Position = UDim2.fromOffset(result.x, result.y)
 	self.scale.Scale = factor
+	--[[
+		Remember what was just placed.
+
+		`animateIn` grows the panel out of the main window and has to end on
+		exactly this rectangle; keeping it here means the geometry is computed
+		ONCE (by PanelPlacement) rather than derived a second time, incorrectly.
+	]]
+	self.placed = {
+		x = result.x,
+		y = result.y,
+		w = self.baseWidth * factor,
+		h = unscaledHeight * factor,
+	}
 	return result
 end
 
@@ -21266,7 +23282,7 @@ function InfoWindow.resetPlacement(self)
 	InfoWindow.loadBaseSize(self)
 	InfoWindow.applyBaseSize(self)
 
-	local screen = screenSize()
+	local screen = usableScreen(self) or screenSize()
 	local height = if self.minimized then MINIMIZED_HEIGHT else self.baseHeight
 	self.store:set("uiState.savedInfo", {
 		xs = 0,
@@ -21384,10 +23400,21 @@ end
 	Show: grows OUT of the main window's centre with a Back (overshoot) ease.
 	Hide: shrinks back INTO that same point, so closing reads as fusing back in.
 
-	The transform is `Size` + `Position` (with the UIScale left alone, because
-	`place()` owns its factor). The geometry is handed back to `place()` when the
-	motion finishes, so this is purely an effect and the panel always ends up
-	exactly where the normal layout code puts it.
+	The transform is `Size` + `Position`, with the UIScale left alone because
+	`place()` owns its factor.
+
+	WHAT WAS WRONG, because the reported symptom is precise -- "它会在原地跳一下，
+	然后突然卡到目标位置去": the panel's AnchorPoint is set to the CENTRE for this
+	motion, but the tween's end Position was computed as if it were the TOP-LEFT
+	corner (`centreX - baseWidth / 2`). So the panel animated to a spot half its
+	size up and to the left of where it belongs, and then the delayed step snapped
+	it to the real place -- one visible jump, every single time the panel opened.
+
+	The end position is now the CENTRE of the rectangle `place()` actually
+	resolved, so the motion ends exactly where the layout says the panel lives and
+	the hand-over is a no-op. The size stays in UNSCALED units (the UIScale
+	multiplies it), while the position is in rendered pixels -- mixing those two
+	was the other half of the error.
 ]]
 function InfoWindow.animateIn(self)
 	if self.frame == nil or self.scale == nil then
@@ -21403,15 +23430,29 @@ function InfoWindow.animateIn(self)
 		return
 	end
 
-	local centreX = merge.X
-	local centreY = merge.Y
+	-- The rect the layout resolved, or the current one if `place()` has not run.
+	local placed = self.placed
+	if placed == nil then
+		local okPosition, position = pcall(function()
+			return self.frame.AbsolutePosition
+		end)
+		local okSize, size = pcall(function()
+			return self.frame.AbsoluteSize
+		end)
+		if okPosition and okSize then
+			placed = { x = position.X, y = position.Y, w = size.X, h = size.Y }
+		end
+	end
+	local targetCentreX = if placed ~= nil then placed.x + placed.w / 2 else merge.X
+	local targetCentreY = if placed ~= nil then placed.y + placed.h / 2 else merge.Y
+
 	self.frame.AnchorPoint = Vector2.new(0.5, 0.5)
-	self.frame.Position = UDim2.fromOffset(centreX, centreY)
+	self.frame.Position = UDim2.fromOffset(merge.X, merge.Y)
 	self.frame.Size = UDim2.fromOffset(self.baseWidth * 0.2, height * 0.2)
 	self.frame.BackgroundTransparency = 1
 
 	self.kit:tween(self.frame, 0.3, {
-		Position = UDim2.fromOffset(centreX - self.baseWidth / 2, centreY - height / 2),
+		Position = UDim2.fromOffset(targetCentreX, targetCentreY),
 		Size = UDim2.fromOffset(self.baseWidth, height),
 		BackgroundTransparency = 0,
 	}, Enum.EasingStyle.Back)
@@ -21419,7 +23460,8 @@ function InfoWindow.animateIn(self)
 		if self.frame == nil then
 			return
 		end
-		-- Hand geometry back to the layout owner.
+		-- Hand geometry back to the layout owner. This is now a NO-OP in
+		-- practice: the tween already landed on the resolved rectangle.
 		self.frame.AnchorPoint = Vector2.new(0, 0)
 		InfoWindow.applyBaseSize(self)
 		InfoWindow.place(self)
@@ -22918,13 +24960,57 @@ Page.build = function(kit, page, shell)
 	kit:section(page, "全图杀戮")
 	local area = kit:card(page)
 	kit:toggle(area, { label = "开启全图杀戮", path = "kill.enabled" })
+	--[[
+		NO RANGE INPUT ANY MORE, and the notes say why.
+
+		"搜索范围是不限制的，它是搜索全图玩家" -- so the scan is the whole map (the
+		old `kill.range` key is kept in the schema as a LIVE key, never read, only
+		so an older config file loads without an "unknown key" warning).
+	]]
+	kit:note(area, "搜索范围不限制：扫描全图玩家，只挑最近的打")
+	kit:toggle(area, {
+		label = "打完就换下一个（跳过打不过的）",
+		path = "kill.powerCheck",
+		hint = "用双方力量/耐力（耐力=血量）算命中数赛跑：对方明显更强才跳过（不是差一点就跳）",
+	})
 	kit:input(area, {
-		label = "搜索范围（格）",
-		path = "kill.range",
-		min = 20,
-		max = 2000,
-		default = 400,
-		hint = "只影响全图杀戮挑最近的敌人；手选目标不受它限制",
+		label = "最多需要几拳",
+		path = "kill.powerMaxHits",
+		min = 1,
+		max = 500,
+		default = 30,
+		hint = "对方耐力 ÷ 我方力量超过这个数就算「打不死」，直接跳过",
+	})
+	--[[
+		THE LOCK TIMEOUT, on the user's own numbers: "如果超时 10 秒没打过，那就给它
+		跳过". The second box is what makes that stick -- a skipped player is not
+		re-picked until the cooldown runs out.
+	]]
+	kit:input(area, {
+		label = "单个目标超时（秒）",
+		path = "kill.targetTimeout",
+		min = 2,
+		max = 120,
+		default = 10,
+		hint = "同一个人打这么久还没死就换人",
+	})
+	kit:input(area, {
+		label = "跳过冷却（秒）",
+		path = "kill.targetSkip",
+		min = 0,
+		max = 3600,
+		default = 60,
+		hint = "被超时跳过的人多久之内不再选他（0 = 立刻可以再选）",
+	})
+	--[[
+		The safe-zone skip, switchable -- the first version over-skipped ("很多人
+		异常打不到，很多玩家都被异常跳过了") and one click has to be enough to
+		turn it off while we narrow it.
+	]]
+	kit:toggle(area, {
+		label = "跳过打不死的地方（万圣节健身房 / 小岛 / Boss 竞技场）",
+		path = "kill.skipSafeZones",
+		hint = "关闭后这些地方的人也会被打（但通常打不死）",
 	})
 	kit:toggle(area, {
 		label = "贴身攻击",
@@ -22945,16 +25031,18 @@ Page.build = function(kit, page, shell)
 
 		One number for BOTH halves, so the swap rates are equal by construction --
 		the user's "工具切换速度要两两齐平". Too short and neither a rep nor a
-		punch lands; too long and one side starves.
+		punch lands; too long and one side starves. The default came down from
+		0.6 to 0.25 after "使用多种工具时，那个工具的交替太慢了": 0.6 meant a full
+		glove -> tool -> glove cycle took 1.2 s.
 	]]
 	kit:slider(extras, {
 		label = "双工具切换间隔（秒）",
 		path = "kill.dualInterval",
 		min = 0.1,
 		max = 3,
-		default = 0.6,
+		default = 0.25,
 		commitOnly = true,
-		hint = "每个半程持握工具的时长；两半相同",
+		hint = "每个半程持握工具的时长；两半相同，越小切换越快",
 	})
 
 	--[[
@@ -23200,6 +25288,26 @@ Page.build = function(kit, page, shell)
 		LayoutOrder = kit:nextOrder(status),
 	}, status)
 
+	--[[
+		WHY PEOPLE ARE NOT BEING ATTACKED, spelled out.
+
+		The user's report was "很多人异常打不到，很多玩家都被异常跳过了" -- and
+		from the outside there is no way to tell which rule did it. This row
+		counts each skip rule and names the players the timeout took out.
+	]]
+	local skipLabel = kit:instance("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 32),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamMedium,
+		Text = "跳过统计：-",
+		TextColor3 = kit:color("TextSecond"),
+		TextSize = 12,
+		TextWrapped = true,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextYAlignment = Enum.TextYAlignment.Top,
+		LayoutOrder = kit:nextOrder(status),
+	}, status)
+
 	shell:addUiTick(function()
 		if combat == nil then
 			return
@@ -23208,6 +25316,32 @@ Page.build = function(kit, page, shell)
 		-- The reason string is what makes "nothing is happening" answerable.
 		label.Text = string.format("目标 %s · 出拳 %d · 选敌结果 %s",
 			tostring(stats.locked or "无"), stats.punches, tostring(stats.lastReason))
+
+		local skips = stats.skipStats or {}
+		local parts = { string.format("扫描 %d 人", skips.total or 0) }
+		if (skips.protected or 0) > 0 then
+			table.insert(parts, string.format("安全区 %d", skips.protected))
+		end
+		if (skips.unwinnable or 0) > 0 then
+			table.insert(parts, string.format("打不过 %d", skips.unwinnable))
+		end
+		if (skips.skipped or 0) > 0 then
+			table.insert(parts, string.format("超时跳过 %d", skips.skipped))
+		end
+		local text = "跳过统计：" .. table.concat(parts, " · ")
+		if stats.skippedCount ~= nil and stats.skippedCount > 0 then
+			local names = stats.skippedIds or {}
+			local shown = {}
+			for index, name in ipairs(names) do
+				if index > 4 then
+					break
+				end
+				table.insert(shown, name)
+			end
+			text = text .. string.format("\n冷却中：%s%s", table.concat(shown, "、"),
+				if #names > #shown then "…" else "")
+		end
+		skipLabel.Text = text
 	end)
 end
 
@@ -23525,6 +25659,7 @@ __modules["ui/Pages/Pets"] = function()
 ]]
 
 local Shell = require("ui/Shell")
+local CrystalList = require("core/CrystalList")
 
 local Page = {}
 
@@ -23842,18 +25977,161 @@ Page.build = function(kit, page, shell)
 		path = "crystal.autoSell",
 		hint = "保存到服务器的自动出售配置（saveAutoSell）",
 	})
+
+	--[[
+		WHICH PETS ARE SOLD, chosen one by one.
+
+		The old flow was a single button that put the crystal's ENTIRE pool into
+		the sell list -- "自动出售该水晶的宠物" meant "sell everything from this
+		crystal". The user's correction: "实际上应该是让我来选择出售哪些宠物，就是
+		该水晶的哪些宠物，并且都是会保留的" -- so this is a checkbox per pet, a
+		ticked pet is sold, and everything unticked is kept. The selection is
+		per crystal and lives in `crystal.sellByCrystal`, so switching crystals
+		shows that crystal's own list and a reload remembers every one of them.
+	]]
+	kit:note(crystalCard, "下面勾选的是「要卖掉」的宠物；没勾的都会保留（按水晶分别记住）")
+
+	local sellList = kit:instance("Frame", {
+		Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1,
+		LayoutOrder = kit:nextOrder(crystalCard),
+	}, crystalCard)
+	kit:list(sellList, 2)
+
+	-- The live widgets, keyed by pet name, rebuilt when the crystal's pool
+	-- changes (a different crystal, or the catalogue arriving late).
+	--
+	-- The row type is deliberately plain (`any` for the instances): this
+	-- analyzer's host whitelist has no Roblox class types, so `TextButton` is an
+	-- unknown type here.
+	local rows: { [string]: { frame: any, box: any, mark: any, name: string } } = {}
+	local rowOrder = 0
+	local builtFor = nil
+
+	local function clearRows()
+		for _, row in pairs(rows) do
+			pcall(function()
+				row.frame:Destroy()
+			end)
+		end
+		table.clear(rows)
+	end
+
+	local function paint(row, marked)
+		row.mark.BackgroundColor3 = if marked then kit:color("Green") else kit:color("BgSoft")
+		row.mark.Text = if marked then "✓" else ""
+		row.mark.TextColor3 = if marked then kit:color("White") else kit:color("TextMuted")
+	end
+
+	local function buildRows(pool, crystalName)
+		clearRows()
+		rowOrder = 0
+		for _, pet in ipairs(pool) do
+			rowOrder += 1
+			local row = kit:instance("Frame", {
+				Size = UDim2.new(1, 0, 0, 26),
+				BackgroundTransparency = 1,
+				LayoutOrder = rowOrder,
+			}, sellList)
+
+			local box = kit:instance("TextButton", {
+				Size = UDim2.fromOffset(22, 22),
+				Position = UDim2.fromOffset(0, 2),
+				BackgroundColor3 = kit:color("BgSoft"),
+				BorderSizePixel = 0,
+				Font = Enum.Font.GothamBold,
+				Text = "",
+				TextSize = 14,
+				ZIndex = 2,
+			}, row)
+			kit:corner(box, 5)
+			kit:stroke(box, kit:color("Border"), 1, 0)
+
+			kit:instance("TextLabel", {
+				BackgroundTransparency = 1,
+				Position = UDim2.fromOffset(30, 0),
+				Size = UDim2.new(1, -30, 1, 0),
+				Font = Enum.Font.GothamMedium,
+				Text = pet,
+				TextColor3 = kit:color("TextPrimary"),
+				TextSize = 13,
+				TextXAlignment = Enum.TextXAlignment.Left,
+				TextTruncate = Enum.TextTruncate.AtEnd,
+			}, row)
+
+			local entry = { frame = row, box = box, mark = box, name = pet }
+			rows[pet] = entry
+
+			kit:track(box.MouseButton1Click:Connect(function()
+				if crystals == nil then
+					return
+				end
+				local next = not CrystalList.isMarked(kit.store:get("crystal.sellByCrystal"), crystalName, pet)
+				crystals:setSell(pet, next)
+			end))
+		end
+		builtFor = crystalName
+	end
+
+	--[[
+		Repaint from the STORE, not from the click.
+
+		The click only writes `crystal.sellByCrystal`; the subscription below is
+		what ticks the box -- so a change made from a loaded config slot, or from
+		a second window, shows up here too.
+	]]
+	local function repaint()
+		local selected = kit.store:get("crystal.selected")
+		local crystalName = if type(selected) == "string" then selected else ""
+		local pool = if crystals ~= nil then crystals:selectedPool() else {}
+		if builtFor ~= crystalName or #pool ~= rowOrder then
+			buildRows(pool, crystalName)
+		end
+		local map = kit.store:get("crystal.sellByCrystal")
+		for pet, row in pairs(rows) do
+			paint(row, CrystalList.isMarked(map, crystalName, pet))
+		end
+	end
+
+	kit:track(kit.store:subscribe("crystal.sellByCrystal", repaint))
+	kit:track(kit.store:subscribe("crystal.selected", repaint))
+	shell:addUiTick(function()
+		-- The catalogue arrives with the game data, so the pool can go from
+		-- empty to full without any store change at all.
+		local selected = kit.store:get("crystal.selected")
+		local crystalName = if type(selected) == "string" then selected else ""
+		local pool = if crystals ~= nil then crystals:selectedPool() else {}
+		if builtFor ~= crystalName or #pool ~= rowOrder then
+			repaint()
+		end
+	end)
+
 	kit:dualButtons(crystalCard, {
-		label = "生成出售列表（该水晶全部宠物）",
+		label = "全选（该水晶全部出售）",
 		onClick = function()
 			if crystals == nil then
 				return
 			end
-			local count = crystals:fillSellFromPool()
+			local count = crystals:setPoolSell(true)
 			if count > 0 then
-				shell:toast(string.format("已把该水晶的 %d 种宠物加入出售列表", count), "success")
+				shell:toast(string.format("已勾选该水晶的 %d 种宠物", count), "success")
 			end
 		end,
 	}, {
+		label = "全不选（全部保留）",
+		onClick = function()
+			if crystals == nil then
+				return
+			end
+			local count = crystals:setPoolSell(false)
+			if count > 0 then
+				shell:toast(string.format("已取消该水晶的 %d 种宠物（全部保留）", count), "info")
+			end
+		end,
+	})
+
+	kit:button(crystalCard, {
 		label = "应用出售配置",
 		role = "Green",
 		onClick = function()
@@ -23886,24 +26164,27 @@ Page.build = function(kit, page, shell)
 	}, crystalCard)
 
 	shell:addUiTick(function()
-		local stored = kit.store:get("crystal.sellPets")
-		local names = {}
-		if type(stored) == "table" then
-			for _, entry in ipairs(stored) do
-				if type(entry) == "table" and type(entry.name) == "string" then
-					table.insert(names, entry.name)
-				end
+		-- The count and the names come from the SELECTION, so the read-out and
+		-- the checkboxes can never disagree.
+		if crystals ~= nil then
+			local sell = crystals:sellSelection()
+			local names = {}
+			for name in pairs(sell) do
+				table.insert(names, name)
 			end
+			table.sort(names)
+			sellLabel.Text = if #names == 0
+				then "出售列表：（空，一个都不卖，全部保留）"
+				else string.format("要卖掉 %d 种：%s", #names, table.concat(names, "、"))
 		end
-		sellLabel.Text = if #names == 0
-			then "出售列表：（空，点上面按钮生成）"
-			else string.format("出售列表：%d 种 · %s", #names, table.concat(names, "、"))
 		if crystals ~= nil then
 			local stats = crystals:stats()
 			crystalStatus.Text = string.format("水晶状态：已开 %d · 配置 %d 次 · 列表 %d 个 · 最近 %s",
 				stats.opened, stats.applied, stats.count, tostring(stats.last))
 		end
 	end)
+
+	repaint()
 
 	kit:section(page, "宠物收益")
 	local metricsCard = kit:card(page)
@@ -24276,7 +26557,7 @@ Page.build = function(kit, page, shell)
 		path = "follow.enabled",
 		hint = "开着它：目标玩家一走就盯着他；他上线且在别的服务器时立刻跟过去，不在游戏里就等着",
 	})
-	kit:note(rejoin, "跟随使用上面的「目标玩家用户名」；只去他的服务器，不会随便换服")
+	kit:note(rejoin, "跟随使用上面的「目标玩家用户名」；查得到位置时只去他的服务器，查不到才会挨个扫服")
 	kit:slider(rejoin, {
 		label = "查询间隔（秒）",
 		path = "follow.poll",
@@ -24310,6 +26591,24 @@ Page.build = function(kit, page, shell)
 		max = 20,
 		default = 4,
 		hint = "一次游戏里最多尝试加入几次",
+	})
+	--[[
+		THE SWEEP. This is the switch that makes following work when the presence
+		API cannot say where the player is -- the reported "如果目标玩家不在同个
+		服务器，但在相同游戏的其他服务器内，他就是没法获取到".
+	]]
+	kit:toggle(rejoin, {
+		label = "查不到就一直扫服（推荐开）",
+		path = "follow.sweep",
+		hint = "查不到目标在哪个服时，挨个换服去找他；进了他的服就会认出来并停下",
+	})
+	kit:input(rejoin, {
+		label = "扫服间隔（秒）",
+		path = "follow.sweepGap",
+		min = 5,
+		max = 600,
+		default = 20,
+		hint = "每次换服之间的等待；判定一次加入结果本身要 20 秒",
 	})
 
 	local followLabel = kit:instance("TextLabel", {
@@ -24351,6 +26650,14 @@ Page.build = function(kit, page, shell)
 		end
 		if status.waited > 0 and status.action ~= "watch" then
 			extra = extra .. string.format(" · 已等待 %d 秒", math.floor(status.waited))
+		end
+		-- The sweep's own progress, because "扫到第几个服了" is the one thing a
+		-- brute-force follow cannot otherwise be asked about.
+		if status.sweep and (status.sweeps > 0 or status.sweepFailed) then
+			extra = extra .. string.format(" · 已扫 %d 个服", status.sweepCursor)
+			if status.sweepFailed then
+				extra = extra .. "（拿不到服务器列表）"
+			end
 		end
 		followLabel.Text = string.format("跟随状态：%s%s\n%s", tostring(status.action), extra, tostring(status.reason))
 		followLabel.TextColor3 = if status.inThisServer or status.action == "watch"
@@ -25421,6 +27728,15 @@ function Main.start()
 			size = function()
 				return size
 			end,
+			--[[
+				The machine, for the same late-binding reason: `Machine` is
+				installed after Boss and Combat, and while the machine holds the
+				seat (which only happens when the user let it win via
+				machine.overridesCombat) the fight must not pin the body off it.
+			]]
+			machineSeated = function()
+				return machine ~= nil and Machine.isSeated(machine)
+			end,
 			notify = notify("boss"),
 		})
 
@@ -25444,6 +27760,11 @@ function Main.start()
 			motion = motion,
 			-- The 0.025 s pin for player targets (independent timer from the boss's).
 			teleport = teleport,
+			-- See Boss.install: the machine is installed after Combat, so this is
+			-- a late-bound getter rather than a captured value.
+			machineSeated = function()
+				return machine ~= nil and Machine.isSeated(machine)
+			end,
 			net = net,
 			arbiter = arbiter,
 			pets = pets,
@@ -25689,6 +28010,20 @@ function Main.start()
 		end
 
 		--[[
+			Click-through guard: the info panel floats over the main window, so the
+			shell asks whether the press landed on the panel before it starts
+			dragging the window. Without it a press that falls on one of the
+			panel's non-Active children (a label, the read-out list) also drags the
+			main window's title bar underneath.
+		]]
+		shell.isOverlayAt = function(x, y)
+			if infoWindow == nil or InfoWindow.overRect == nil then
+				return false
+			end
+			return InfoWindow.overRect(infoWindow, x, y)
+		end
+
+		--[[
 			The rejoin cancel dialog.
 
 			Wired here, after the shell exists, because Rejoin is installed well
@@ -25827,6 +28162,9 @@ function Main.start()
 		machine = machine,
 		pets = pets,
 		rebirth = rebirth,
+		-- Published like the rest: the crystal feature is reachable from the
+		-- session handle (the smoke harness drives its sell selection through it).
+		crystals = crystals,
 		metrics = metrics,
 		rejoin = rejoin,
 		antiAfk = antiAfk,
