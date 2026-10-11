@@ -2,8 +2,8 @@
 -- ===========================================================================
 --  MKUltraHUB -- GENERATED BUNDLE. DO NOT EDIT.
 --  Source of truth: src\**\*.luau   Builder: tools\bundle.ps1
---  Modules: 68   Entry: main
---  Generated: 2026-10-11 10:33:17
+--  Modules: 70   Entry: main
+--  Generated: 2026-10-11 12:12:03
 -- ===========================================================================
 
 local __modules = {}
@@ -1049,7 +1049,7 @@ export type Report = {
 
 local THEMES = { "light", "dark", "ocean", "sakura", "forest", "flame" }
 local ANTI_PULL = { "off", "normal", "strict" }
-local REJOIN_MODES = { "same", "crowded", "private", "sparse" }
+local REJOIN_MODES = { "same", "crowded", "private", "sparse", "player" }
 local RARITIES = { "Common", "Rare", "Epic", "Legendary", "Rainbow", "Mythic" }
 -- Which GROUP of boss to attack first when both are available. "event" is the
 -- default because the event bosses are the time-limited ones.
@@ -1179,6 +1179,27 @@ local SCHEMA: { Spec } = {
 	bool("pet.autoEgg", false),
 	num("pet.eggBatch", 10, 1, 500),
 	bool("pet.autoPack", false),
+
+	-- crystals ---------------------------------------------------------------
+	--[[
+		CRYSTALS (`openCrystalRemote`).
+
+		The protocol was confirmed from a Cobalt recording of the game calling
+		itself: `InvokeServer("openCrystal", "<name>")` to hatch and
+		`InvokeServer("saveAutoSell", "<name>", { Pets = {..}, Enabled = .., Auras = {} })`
+		to persist an auto-sell list. Both are per-crystal, so the selection is a
+		NAME from the catalogue rather than a hard-coded one.
+
+		`crystal.auto` defaults OFF like every other action-performing switch:
+		opening crystals spends the player's currency.
+	]]
+	bool("crystal.auto", false),
+	str("crystal.selected", ""),
+	num("crystal.rate", 2, 1, 20),
+	bool("crystal.autoSell", false),
+	-- The pet names to auto-sell, as the same { name, count } list the pet
+	-- presets use (the count is ignored by the payload -- see core/CrystalList).
+	preset("crystal.sellPets"),
 
 	-- teleport ---------------------------------------------------------------
 	bool("tp.autoMK", false),
@@ -1335,6 +1356,15 @@ local SCHEMA: { Spec } = {
 	num("rejoin.pingThresh", 800, 100, 5000),
 	enm("rejoin.mode", "same", REJOIN_MODES),
 	str("rejoin.privId", ""),
+	--[[
+		跳到一个指定玩家所在的服务器 ("前往目标用户名的服务器").
+
+		The NAME is what the user types; the job id is resolved at rejoin time
+		(users.roblox.com -> presence.roblox.com), so a renamed or offline player
+		simply falls through to the next rung of the fallback chain instead of
+		being an error.
+	]]
+	str("rejoin.targetPlayer", ""),
 
 	--[[
 		Metadata that travels INSIDE a config file rather than describing a
@@ -1351,6 +1381,16 @@ local SCHEMA: { Spec } = {
 	bool("machine.enabled", false),	str("machine.gymFilter", ""),
 	str("machine.nameFilter", ""),
 	num("machine.indexFilter", 0, 0, 500),
+	--[[
+		LET THE MACHINE WIN OVER COMBAT.
+
+		Default OFF, because the arbiter's point is that a machine blocks damage
+		(打 Boss > 全城杀戮 > 器械). But with auto-boss on there is almost always a
+		boss alive, so the machine stands down essentially forever and reads as
+		"启用了器械还是不上". This switch is the explicit override, and when it is
+		on the blocked reason says so instead of silently doing nothing.
+	]]
+	bool("machine.overridesCombat", false),
 
 	-- anti afk ---------------------------------------------------------------
 	num("antiAfk.interval", 300, 60, 1140),
@@ -5002,6 +5042,120 @@ function ServerPick.plan(mode: string?, servers: { Server }, currentJobId: strin
 	return { mode = resolved, code = nil, ids = ordered }
 end
 
+--[[
+	THE GRADIENT FALLBACK CHAIN ("梯度降级机制").
+
+	`plan` answers "in which order do we try servers for THIS mode". This answers
+	the question the user actually asked: "what do we try WHEN that fails, and
+	what if the player we were looking for is not there?"
+
+	One ordered attempt list, most specific first, each rung reached only after the
+	previous one demonstrably failed to change the server:
+
+	    player    -- the named player's own server (nil when not resolvable)
+	    private   -- the private code, when one is configured AND looks valid
+	    servers   -- the busiest / quietest public servers
+	    current   -- this server, which always succeeds at "somewhere"
+
+	Returned as data because both halves are decisions: WHICH rung is next (pure,
+	tested) and HOW it is attempted (game/Rejoin, engine calls).
+]]
+export type Attempt = {
+	kind: string, -- "job" | "private"
+	id: string?,
+	code: string?,
+	label: string,
+}
+
+function ServerPick.chain(
+	mode: string?,
+	servers: { Server },
+	currentJobId: string?,
+	privateInput: string?,
+	targetJobId: string?
+): { Attempt }
+	local resolved = mode or "same"
+	local attempts: { Attempt } = {}
+
+	local function hasId(id: string?): boolean
+		if id == nil or id == "" then
+			return false
+		end
+		for _, attempt in ipairs(attempts) do
+			if attempt.id == id then
+				return true
+			end
+		end
+		return false
+	end
+
+	local function addJob(id: string?, label: string)
+		--[[
+			A MISSING id IS NOT AN ATTEMPT.
+
+			Without this guard the `player` mode inserted a `{ kind = "job", id = nil }`
+			rung when the named player could not be resolved, which the caller then
+			had to recognise and skip -- and "skip the empty rung" is exactly the
+			kind of bookkeeping that ends up wrong (the first version of the chain
+			did not skip it at all). The chain must contain only real targets.
+		]]
+		if id == nil or id == "" then
+			return
+		end
+		if hasId(id) then
+			return
+		end
+		table.insert(attempts, { kind = "job", id = id, code = nil, label = label })
+	end
+
+	local code = ServerPick.privateCode(privateInput)
+	local function addPrivate(label: string)
+		-- A code that is not a code (empty, or a URL that did not parse) is NOT an
+		-- attempt: trying it would fail and delay the next rung.
+		if code == nil or code == "" then
+			return
+		end
+		table.insert(attempts, { kind = "private", id = nil, code = code, label = label })
+	end
+
+	if resolved == "player" then
+		-- 1) the named player's server, 2) private, 3) quiet public servers,
+		-- 4) this server.
+		addJob(targetJobId, "目标玩家所在服")
+		addPrivate("私服")
+		for _, server in ipairs(sortByPlayers(servers, false)) do
+			addJob(server.id, "人少的服务器")
+		end
+	elseif resolved == "private" then
+		addPrivate("私服")
+		for _, server in ipairs(sortByPlayers(servers, false)) do
+			addJob(server.id, "人少的服务器")
+		end
+	elseif resolved == "crowded" then
+		for _, server in ipairs(sortByPlayers(servers, true)) do
+			addJob(server.id, "人多的服务器")
+		end
+	elseif resolved == "sparse" then
+		for _, server in ipairs(sortByPlayers(servers, false)) do
+			addJob(server.id, "人少的服务器")
+		end
+	else
+		addJob(currentJobId, "原服务器")
+		for _, server in ipairs(sortByPlayers(servers, true)) do
+			addJob(server.id, "人多的服务器")
+		end
+	end
+
+	-- The last rung always exists: staying/returning here beats "cannot rejoin".
+	if resolved ~= "same" then
+		addJob(currentJobId, "原服务器")
+	end
+	if #attempts == 0 and currentJobId ~= nil and currentJobId ~= "" then
+		addJob(currentJobId, "原服务器")
+	end
+	return attempts
+end
+
 return ServerPick
 end
 
@@ -6350,6 +6504,23 @@ end
 
 function Remotes.machine()
 	return exactOrKeyword("machineInteractRemote", "machineinteractremote", 5)
+end
+
+--[[
+	THE CRYSTAL REMOTE.
+
+	One RemoteFunction for the whole crystal feature (`openCrystalRemote`):
+
+	    InvokeServer("openCrystal", "<Crystal Name>")            -- hatch one
+	    InvokeServer("saveAutoSell", "<Crystal Name>", {          -- auto-sell
+	        Pets = { ["<Pet>"] = true }, Enabled = <bool>, Auras = {}
+	    })
+
+	Cobalt recordings of the game calling itself are how this shape was
+	confirmed; see game/Crystals for the calls.
+]]
+function Remotes.crystal()
+	return exactOrKeyword("openCrystalRemote", "opencrystalremote", 5)
 end
 
 --[[
@@ -9960,6 +10131,72 @@ local function objectPosition(object)
 end
 
 --[[
+	At least one visible BasePart?
+
+	`HumanoidRootPart` is excluded because it is invisible on every healthy rig --
+	including it would make every live boss read as "hidden". A rig too large to
+	check within the budget counts as visible, because "probably hidden" must never
+	be the reason a fight is abandoned.
+]]
+local VISIBLE_PARTS_LIMIT = 60
+
+local function hasVisiblePart(model): boolean
+	if model == nil then
+		return true
+	end
+	local total = 0
+	for _, part in ipairs(model:GetDescendants()) do
+		if part:IsA("BasePart") then
+			total += 1
+			if total > VISIBLE_PARTS_LIMIT then
+				return true
+			end
+			if part.Name ~= "HumanoidRootPart" then
+				local ok, transparency = pcall(function()
+					return part.Transparency
+				end)
+				if not ok or type(transparency) ~= "number" or transparency < 0.99 then
+					return true
+				end
+			end
+		end
+	end
+	-- No parts at all: nothing to judge, so not "hidden".
+	return total == 0
+end
+
+--[[
+	IS THIS RIG DOWN?
+
+	THE GAME DOES NOT DELETE A DEFEATED BOSS. It hides it: the model stays in the
+	arena with `Health = 0` and its parts made invisible, which is what the user
+	described ("这个游戏比较粗制滥造，他没有移除 boss 模型，他只是把 boss 隐藏了").
+
+	The old check only asked "does a model exist", so:
+
+	  * the fight kept hovering over and punching an invisible corpse --
+	    "它还是会在原地试图去攻击 Boss";
+	  * the NEXT boss of the event sequence was never reached, because the first
+	    one still counted as alive;
+	  * the chest never opened, because the death was never observed.
+
+	So "down" is any of: HP <= 0, a dead Humanoid, or no visible BasePart left.
+	`nil` HP means "unmeasurable", which is deliberately NOT down -- skipping a
+	boss we cannot read would be worse than attacking it.
+]]
+local function bossDown(holder, model): boolean
+	local health = readHealth(holder, model)
+	if health ~= nil and health <= 0 then
+		return true
+	end
+	local humanoid = holder:FindFirstChildWhichIsA("Humanoid", true)
+	if humanoid ~= nil and humanoid.Health <= 0 then
+		return true
+	end
+	return not hasVisiblePart(model)
+end
+
+--[[
 	Fill a record. `group` is "normal" or "event" (see core/BossInfo): it decides
 	which selection switches applied, which hover height the fight uses, and which
 	group `boss.priority` puts first.
@@ -10302,8 +10539,10 @@ function Boss.detectEvent(self)
 			local holder = holders[entry.key]
 			if holder ~= nil and holder.Parent ~= nil then
 				local model = holder:FindFirstChild("Boss") or holder
-				local health = readHealth(holder, model)
-				if health == nil or health > 0 then
+				-- `bossDown`, not just "HP > 0": a defeated event rig is HIDDEN in
+				-- place rather than removed, and the next boss of the sequence must
+				-- be reached the moment this one dies.
+				if not bossDown(holder, model) then
 					return fill(
 						BossInfo.empty(),
 						holder,
@@ -10340,8 +10579,9 @@ function Boss.eventState(self)
 			if holder ~= nil and holder.Parent ~= nil then
 				present += 1
 				local model = holder:FindFirstChild("Boss") or holder
-				local health = readHealth(holder, model)
-				if health == nil or health > 0 then
+				-- Same "down" rule as the detector: a hidden corpse is DEAD, so the
+				-- hop can fire instead of waiting for a boss that will never move.
+				if not bossDown(holder, model) then
 					alive += 1
 				end
 			end
@@ -10363,7 +10603,7 @@ function Boss.detectNormal(self)
 			if BossInfo.selected(entry.rarity, selection) then
 				local holder = arena:FindFirstChild(entry.id)
 				local model = holder ~= nil and holder:FindFirstChild("Boss") or nil
-				if model ~= nil then
+				if model ~= nil and not bossDown(holder, model) then
 					return fill(
 						BossInfo.empty(),
 						holder,
@@ -10379,7 +10619,7 @@ function Boss.detectNormal(self)
 
 		for _, holder in ipairs(arena:GetChildren()) do
 			local model = holder:FindFirstChild("Boss")
-			if model ~= nil then
+			if model ~= nil and not bossDown(holder, model) then
 				--[[
 					AN EVENT RIG SITTING IN THE ARENA FOLDER IS STILL AN EVENT RIG.
 
@@ -10407,16 +10647,28 @@ function Boss.detectNormal(self)
 		end
 	end
 
-	-- Last resort: a flat attribute set on Workspace, with no position at all.
+	--[[
+		Last resort: the flat attributes on Workspace, with no position at all.
+
+		THE SELECTION APPLIES HERE TOO, which it did not before: this branch
+		returned a boss unconditionally, so with `Workspace.BossActive` true (it is,
+		whenever the arena boss is up) an UNCHECKED rarity was attacked anyway --
+		the reported "我即使没有勾选，他也会去打". The rarity the game publishes in
+		`BossRarityName` goes through exactly the same filter as the slots.
+	]]
 	if Workspace:GetAttribute("BossActive") then
-		local info = BossInfo.empty()
-		info.alive = true
-		info.hp = tonumber(Workspace:GetAttribute("BossHealth")) or 0
-		info.maxHp = tonumber(Workspace:GetAttribute("BossMaxHealth")) or 0
-		info.rarity = tostring(Workspace:GetAttribute("BossRarityName") or "?")
-		info.id = tostring(Workspace:GetAttribute("BossDisplayName") or "?")
-		info.group = BossInfo.NORMAL_GROUP
-		return info
+		local rarity = tostring(Workspace:GetAttribute("BossRarityName") or "?")
+		local health = tonumber(Workspace:GetAttribute("BossHealth"))
+		if BossInfo.selected(rarity, selection) and (health == nil or health > 0) then
+			local info = BossInfo.empty()
+			info.alive = true
+			info.hp = health or 0
+			info.maxHp = tonumber(Workspace:GetAttribute("BossMaxHealth")) or 0
+			info.rarity = rarity
+			info.id = tostring(Workspace:GetAttribute("BossDisplayName") or "?")
+			info.group = BossInfo.NORMAL_GROUP
+			return info
+		end
 	end
 
 	return nil
@@ -11301,6 +11553,516 @@ end
 return Size
 end
 
+__modules["core/CrystalList"] = function()
+-- (module directive --!strict; the bundle is --!nonstrict)
+--[[
+	CrystalList -- the crystal catalogue, as pure data handling.
+
+	The game publishes every crystal under
+	`ReplicatedStorage.shared.catalogs.crystalChances`, one child per crystal
+	("Hallowed Crystal", "Overcharged Crystal", ...) whose CHILDREN are that
+	crystal's possible pets. Prices live next door in `crystalPrices`, as
+	`{ price = <number>, priceType = "Gems" | "CandyCorn" | ... }`.
+
+	This module only turns those tables into lists, so the shape is testable
+	without a game: given the same nested tables the engine would hand back, do we
+	produce the same names, in a stable order, with the same labels? The engine
+	reads live in game/Crystals.
+
+	Ordering is the specification, as everywhere else in this project: sorted by
+	name, so a dropdown does not reshuffle between scans.
+]]
+
+local CrystalList = {}
+
+export type Entry = {
+	name: string,
+	price: number?,
+	priceType: string?,
+	label: string,
+}
+
+--[[
+	Every crystal, sorted, with its price when the catalogue has one.
+
+	`chances` is the `crystalChances` folder's shape as a plain table: key -> any
+	truthy value. Only the KEYS matter, which is what lets the same function serve
+	the live folder (keys read by the caller) and a test fixture.
+]]
+function CrystalList.parse(chances: { [string]: any }?, prices: { [string]: any }?): { Entry }
+	local out: { Entry } = {}
+	if chances == nil then
+		return out
+	end
+	--[[
+		The keys are copied out with `tostring` FIRST.
+
+		`pairs` over a table typed as `{ [string]: any }` yields `unknown` for the
+		key in this analyzer, so building the record inline was a type error
+		("Expected this to be 'string', but got 'unknown'"). Collecting and
+		SORTING the names first also makes the output order a property of this
+		function rather than of the hash iteration.
+	]]
+	local names: { string } = {}
+	for rawName in pairs(chances) do
+		table.insert(names, tostring(rawName))
+	end
+	table.sort(names)
+
+	for _, name in ipairs(names) do
+		local price = nil
+		local priceType = nil
+		local record = prices ~= nil and prices[name] or nil
+		if type(record) == "table" then
+			price = tonumber((record :: any).price)
+			local kind = (record :: any).priceType
+			if type(kind) == "string" then
+				priceType = kind
+			end
+		end
+		--[[
+			The label is assembled from TYPED locals rather than from an inline
+			`if`-expression: the analyzer resolved the nested one as `unknown` and
+			reported "Expected this to be 'string', but got 'unknown'" at the
+			`string.format` call, while the same expression in locals checks clean.
+		]]
+		local label: string = name
+		if price ~= nil and price > 0 then
+			local kind: string = "价格"
+			if priceType ~= nil then
+				kind = priceType
+			end
+			local amount: string = tostring(math.floor(price))
+			-- Built by CONCATENATION rather than `string.format`: the analyzer
+			-- resolved the format arguments as `unknown` here (they are not) and
+			-- reported "Expected this to be 'string', but got 'unknown'" on a call
+			-- that is perfectly well typed. `tostring` makes the intent explicit
+			-- and the check pass, with identical output.
+			label = tostring(name) .. "（" .. tostring(kind) .. " " .. amount .. "）"
+		end
+		table.insert(out, { name = name, price = price, priceType = priceType, label = label })
+	end
+	return out
+end
+
+-- Does this crystal exist in the catalogue?
+function CrystalList.has(entries: { Entry }, name: string?): boolean
+	if name == nil or name == "" then
+		return false
+	end
+	for _, entry in ipairs(entries) do
+		if entry.name == name then
+			return true
+		end
+	end
+	return false
+end
+
+-- The display labels, for a dropdown.
+function CrystalList.labels(entries: { Entry }): { string }
+	local out: { string } = {}
+	for _, entry in ipairs(entries) do
+		table.insert(out, entry.label)
+	end
+	return out
+end
+
+function CrystalList.labelFor(entries: { Entry }, name: string?): string
+	if name == nil or name == "" then
+		return ""
+	end
+	for _, entry in ipairs(entries) do
+		if entry.name == name then
+			return entry.label
+		end
+	end
+	return name
+end
+
+--[[
+	The auto-sell payload.
+
+	The game's own shape (a Cobalt recording of the game calling itself):
+
+	    { Pets = { ["Candy Cube"] = true, ... }, Enabled = <bool>, Auras = {} }
+
+	i.e. a SET of pet names to sell. The preset in the config is a list of
+	`{ name, count }` records (the same shape the pet presets use), and this turns
+	one into the other: names only, so a count in the preset cannot leak into a
+	payload the game would reject.
+]]
+function CrystalList.sellSet(preset: { { name: string, count: number? } }?): { [string]: boolean }
+	local out: { [string]: boolean } = {}
+	if preset == nil then
+		return out
+	end
+	for _, entry in ipairs(preset) do
+		if type(entry) == "table" and type(entry.name) == "string" and entry.name ~= "" then
+			out[entry.name] = true
+		end
+	end
+	return out
+end
+
+function CrystalList.sellPayload(sell: { [string]: boolean }, enabled: boolean?): { [string]: any }
+	return {
+		Pets = sell,
+		Enabled = enabled == true,
+		Auras = {},
+	}
+end
+
+-- The pool names of one crystal, sorted, given the folder's shape.
+function CrystalList.pool(pools: { [string]: { [string]: any } }?, name: string?): { string }
+	local out: { string } = {}
+	if pools == nil or name == nil then
+		return out
+	end
+	local pool = pools[name]
+	if pool == nil then
+		return out
+	end
+	-- `tostring` for the same reason as `parse`: `pairs` over a `{ [string]: any }`
+	-- hands the analyzer `unknown` for the key, and the collected list is sorted
+	-- anyway.
+	for rawPet in pairs(pool) do
+		table.insert(out, tostring(rawPet))
+	end
+	table.sort(out)
+	return out
+end
+
+return CrystalList
+end
+
+__modules["game/Crystals"] = function()
+	local require = __require
+-- (module directive --!nonstrict; the bundle is --!nonstrict)
+--[[
+	Crystals -- opening crystals, and the auto-sell list that goes with them.
+
+	The adapter for one RemoteFunction (`openCrystalRemote`), whose protocol a
+	Cobalt recording of the game calling itself pins down:
+
+	    Remote:InvokeServer("openCrystal", "Hallowed Crystal")
+	    Remote:InvokeServer("saveAutoSell", "Hallowed Crystal", {
+	        Pets = { ["Candy Cube"] = true, ["Cursed Candle"] = true, ... },
+	        Enabled = false,
+	        Auras = {},
+	    })
+
+	Two properties of that remote shape the design here:
+
+	  * it is a **RemoteFunction**, so `InvokeServer` YIELDS. Every call therefore
+	    runs in a `task.spawn`, and only ONE open is ever in flight (`self.busy`),
+	    because a task per interval tick would pile up invocations and turn a
+	    "2 crystals a second" setting into an unbounded flood;
+	  * it takes the crystal NAME as a string, so the feature is data-driven from
+	    the catalogue (`shared.catalogs.crystalChances`) instead of hard-coding
+	    the one Halloween crystal that happened to be recorded. `core/CrystalList`
+	    does the parsing, this file only reads the live folders and calls.
+
+	Auto-sell is pushed WHEN IT CHANGES (store subscription, debounced), not on
+	every open: it is a saved server-side preference, so re-sending it beside every
+	hatch would be pure traffic. The manual button exists for the case where the
+	server lost the preference (a rejoin) and the user wants it re-applied.
+]]
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local CrystalList = require("core/CrystalList")
+local Remotes = require("game/Remotes")
+
+local Crystals = {}
+Crystals.__index = Crystals
+
+-- How long the remote is allowed to take before another open is dispatched.
+local OPEN_TIMEOUT = 3
+-- Re-applying the sell list is not urgent; coalesce rapid edits.
+local SAVE_DEBOUNCE = 0.6
+
+local function sharedFolder()
+	return ReplicatedStorage:FindFirstChild("shared")
+end
+
+local function catalogsFolder()
+	local shared = sharedFolder()
+	return shared and shared:FindFirstChild("catalogs") or nil
+end
+
+--[[
+	The catalogue as plain tables: `chances[name] = true` for every crystal and
+	`pools[name][pet] = true` for each crystal's possible drops. Read from the
+	live folders; `core/CrystalList` turns them into the sorted lists.
+]]
+local function readCatalogue()
+	local chances = {}
+	local pools = {}
+	local prices = {}
+	local catalogs = catalogsFolder()
+	if catalogs == nil then
+		return chances, prices, pools
+	end
+
+	local chanceFolder = catalogs:FindFirstChild("crystalChances")
+	if chanceFolder ~= nil then
+		for _, crystal in ipairs(chanceFolder:GetChildren()) do
+			chances[crystal.Name] = true
+			local pool = {}
+			for _, drop in ipairs(crystal:GetChildren()) do
+				--[[
+					THE POOL IS READ LIVE, which is the point of doing it this way:
+					the event crystal's pets ("Coffin Crawler" and the rest of the
+					Halloween set) are whatever the catalogue says TODAY, so a new
+					pet or a new crystal needs no code change at all.
+
+					A row may name the pet two ways, so both are accepted: the CHILD's
+					own Name (the common shape), or an attribute/value that carries
+					it (`petName` / `itemValue`), for a build that names the rows
+					"1", "2", ... instead.
+				]]
+				local name = drop.Name
+				local attribute = drop:GetAttribute("petName")
+				if type(attribute) == "string" and attribute ~= "" then
+					name = attribute
+				else
+					local value = drop:FindFirstChild("itemValue") or drop:FindFirstChild("petValue")
+					if value ~= nil and value:IsA("ValueBase") and type(value.Value) == "string" and value.Value ~= "" then
+						name = value.Value
+					end
+				end
+				pool[name] = true
+			end
+			pools[crystal.Name] = pool
+		end
+	end
+
+	local priceFolder = catalogs:FindFirstChild("crystalPrices")
+	if priceFolder ~= nil then
+		for _, crystal in ipairs(priceFolder:GetChildren()) do
+			prices[crystal.Name] = {
+				price = tonumber(crystal:GetAttribute("price"))
+					or tonumber((crystal:FindFirstChild("price") or {}).Value),
+				priceType = crystal:GetAttribute("priceType")
+					or tostring((crystal:FindFirstChild("priceType") or {}).Value or ""),
+			}
+		end
+	end
+
+	return chances, prices, pools
+end
+
+function Crystals.new(context)
+	local self = setmetatable({
+		store = context.store,
+		scheduler = context.scheduler,
+		timers = context.timers,
+		notify = context.notify or function() end,
+		entries = {},
+		pools = {},
+		catalogueAt = 0,
+		lastOpen = 0,
+		busy = false,
+		opened = 0,
+		applied = 0,
+		saveAt = nil,
+		lastResult = "-",
+	}, Crystals)
+	return self
+end
+
+-- The catalogue, cached for a few seconds: it is a tree walk over two folders.
+function Crystals.catalogue(self, force)
+	local now = os.clock()
+	if not force and now - self.catalogueAt < 5 and #self.entries > 0 then
+		return self.entries
+	end
+	self.catalogueAt = now
+	local chances, prices, pools = readCatalogue()
+	self.entries = CrystalList.parse(chances, prices)
+	self.pools = pools
+	return self.entries
+end
+
+function Crystals.labels(self): { string }
+	return CrystalList.labels(Crystals.catalogue(self))
+end
+
+-- The stored NAME -> the label the dropdown shows. One mapping, so the two
+-- directions (toStore strips the price, fromStore re-adds it) cannot drift.
+function Crystals.labelFor(self, name: string?): string
+	local entries = Crystals.catalogue(self)
+	local label = CrystalList.labelFor(entries, name)
+	if label == nil or label == "" then
+		return "—"
+	end
+	return label
+end
+
+-- The pool of the SELECTED crystal, i.e. what the auto-sell list can be built
+-- from. Falls back to the whole catalogue's pets when the pool is unreadable.
+function Crystals.selectedPool(self): { string }
+	local name = self.store:get("crystal.selected")
+	Crystals.catalogue(self)
+	return CrystalList.pool(self.pools, if type(name) == "string" then name else nil)
+end
+
+--[[
+	Hatch one crystal, off the frame path.
+
+	`self.busy` is the flood control: an InvokeServer that has not returned yet
+	must not be joined by another, or a slow server turns the rate setting into a
+	pile of pending invocations.
+]]
+function Crystals.open(self): boolean
+	if self.busy then
+		return false
+	end
+	local remote = Remotes.crystal()
+	local name = self.store:get("crystal.selected")
+	if remote == nil or type(name) ~= "string" or name == "" then
+		return false
+	end
+
+	self.busy = true
+	self.startedAt = os.clock()
+	task.spawn(function()
+		local ok, err = pcall(function()
+			remote:InvokeServer("openCrystal", name)
+		end)
+		self.busy = false
+		if ok then
+			self.opened += 1
+			self.lastResult = "ok"
+		else
+			self.lastResult = tostring(err)
+		end
+	end)
+	return true
+end
+
+--[[
+	Push the auto-sell configuration.
+
+	Sent as its own call because it is a PERSISTED SERVER PREFERENCE, not part of
+	a hatch: once is enough until the user edits the list. The payload shape is the
+	game's own, reproduced exactly (`Pets` as a set, `Enabled`, `Auras`).
+]]
+function Crystals.applyAutoSell(self): boolean
+	local remote = Remotes.crystal()
+	local name = self.store:get("crystal.selected")
+	if remote == nil or type(name) ~= "string" or name == "" then
+		return false
+	end
+	local preset = self.store:get("crystal.sellPets")
+	local sell = CrystalList.sellSet(preset)
+	local payload = CrystalList.sellPayload(sell, self.store:get("crystal.autoSell") == true)
+
+	task.spawn(function()
+		pcall(function()
+			remote:InvokeServer("saveAutoSell", name, payload)
+		end)
+	end)
+	self.applied += 1
+	return true
+end
+
+-- Mark every pet of the selected crystal's pool as sellable.
+function Crystals.fillSellFromPool(self): number
+	local pool = Crystals.selectedPool(self)
+	if #pool == 0 then
+		self.notify("读不到该水晶的宠物池（crystalChances）", "warn")
+		return 0
+	end
+	local preset = {}
+	for _, pet in ipairs(pool) do
+		table.insert(preset, { name = pet, count = 1 })
+	end
+	self.store:set("crystal.sellPets", preset)
+	return #preset
+end
+
+function Crystals.stats(self)
+	local name = self.store:get("crystal.selected")
+	return {
+		crystal = if type(name) == "string" then name else "",
+		opened = self.opened,
+		applied = self.applied,
+		busy = self.busy,
+		last = self.lastResult,
+		count = #Crystals.catalogue(self),
+	}
+end
+
+function Crystals.install(context)
+	local self = Crystals.new(context)
+	local store = self.store
+
+	self.scheduler:register({
+		id = "crystal",
+		priority = 40,
+		enabled = function()
+			return store:get("crystal.auto") == true
+		end,
+		onEnable = function()
+			self.busy = false
+			self.lastOpen = 0
+			-- A fresh enable re-pushes the sell preference: the server may have
+			-- been replaced (a rejoin) since it was last sent.
+			Crystals.applyAutoSell(self)
+		end,
+		tick = function(_dt, now)
+			local rate = tonumber(store:get("crystal.rate")) or 2
+			if rate <= 0 then
+				return
+			end
+			local interval = 1 / math.max(0.05, rate)
+			if now - (self.lastOpen or 0) < interval then
+				return
+			end
+			-- A stuck invocation must not wedge the feature forever.
+			if self.busy and now - (self.startedAt or 0) > OPEN_TIMEOUT then
+				self.busy = false
+			end
+			if self.busy then
+				return
+			end
+			self.lastOpen = now
+			Crystals.open(self)
+		end,
+	})
+
+	--[[
+		AUTO-SELL FOLLOWS THE SETTINGS.
+
+		Debounced through the runtime's Timers so that dragging the sell list (or
+		flipping the switch) sends ONE call rather than one per keystroke.
+	]]
+	local function scheduleApply()
+		local timers = self.timers
+		if timers == nil then
+			Crystals.applyAutoSell(self)
+			return
+		end
+		if self.saveHandle ~= nil then
+			self.saveHandle:cancel()
+		end
+		self.saveHandle = timers:after(os.clock(), SAVE_DEBOUNCE, function()
+			self.saveHandle = nil
+			Crystals.applyAutoSell(self)
+		end)
+	end
+
+	for _, path in ipairs({ "crystal.autoSell", "crystal.sellPets", "crystal.selected" }) do
+		store:subscribe(path, scheduleApply)
+	end
+
+	return self
+end
+
+return Crystals
+end
+
 __modules["game/PetMetrics"] = function()
 	local require = __require
 -- (module directive --!nonstrict; the bundle is --!nonstrict)
@@ -11594,8 +12356,8 @@ local KEY_TAIL = 0.05
 	Now: re-assert the position 6-7x a second, ask the game 3x a second, and give
 	up on a single stubborn seat after 4 s so the next one is tried.
 ]]
-local SIT_INTERVAL = 0.15
-local SEND_INTERVAL = 0.3
+local SIT_INTERVAL = 0.06
+local SEND_INTERVAL = 0.12
 local SEAT_TIMEOUT = 4
 
 -- Reading `Occupant` on a non-seat part errors, so it is only read where it is
@@ -11762,6 +12524,16 @@ end
 -- "明明启用了器械却不上" is unanswerable otherwise: a blocked machine and a
 -- machine with no target look identical from outside.
 function Machine.blockedState(self): (boolean, string?)
+	--[[
+		THE EXPLICIT OVERRIDE.
+
+		With it on, the machine is never asked to step aside. Everything else in
+		the arbiter is unchanged -- this is a user decision, not a policy change,
+		and the UI says so on the switch.
+	]]
+	if self.store:get("machine.overridesCombat") == true then
+		return false, nil
+	end
 	if self.isDamageNeeded() then
 		return true, "有击杀/Boss 任务需要出拳"
 	end
@@ -12615,6 +13387,17 @@ local STARTUP_GRACE = 15
 local CONFIRM_DELAY = 3
 local CHECK_INTERVAL = 1
 local HTTP_COOLDOWN = 300
+--[[
+	HOW LONG A HOP IS GIVEN TO ACTUALLY HAPPEN.
+
+	The teleport CALL returns immediately; the join does not. A full target server
+	fails silently, so the only honest test is "did `game.JobId` change?" -- and it
+	needs a window. 20 s is long enough for a real join (and for Roblox's own
+	error prompt to appear) and short enough that the user does not sit waiting.
+]]
+local HOP_TIMEOUT = 20
+-- The username -> job id lookup is two API calls; a retry loop must not repeat it.
+local PLAYER_CACHE = 60
 
 function Rejoin.new(context)
 	local self = setmetatable({
@@ -12637,33 +13420,132 @@ function Rejoin.new(context)
 		_state = "idle",
 		_triggered = false,
 		pendingHandle = nil,
+		-- The gradient chain of the rejoin in flight, and the hop watchdog's
+		-- bookkeeping (`hopJobId` is the job id we were on when we tried).
+		plan = nil,
+		planIndex = 0,
+		hopAt = 0,
+		hopJobId = "",
+		hopLabel = nil,
+		playerCache = nil,
 		attempts = 0,
 	}, Rejoin)
 	return self
 end
 
-local function httpGet(url)
+local function httpRequest(url, method, body, contentType)
 	local executor = (type(syn) == "table" and syn.request)
 		or (type(http) == "table" and http.request)
 		or (type(fluxus) == "table" and fluxus.request)
 		or request
 		or http_request
 	if type(executor) == "function" then
-		local ok, response = pcall(executor, { Url = url, Method = "GET" })
+		local ok, response = pcall(executor, {
+			Url = url,
+			Method = method or "GET",
+			Body = body,
+			Headers = if body ~= nil
+				then { ["Content-Type"] = contentType or "application/json" }
+				else nil,
+		})
 		if ok and type(response) == "table" then
 			return response.Body or response.body
 		end
 		return nil
 	end
-	if type(game.HttpGet) == "function" then
-		local ok, body = pcall(function()
-			return game:HttpGet(url)
-		end)
-		if ok then
-			return body
+	if method == nil or method == "GET" then
+		if type(game.HttpGet) == "function" then
+			local ok, text = pcall(function()
+				return game:HttpGet(url)
+			end)
+			if ok then
+				return text
+			end
 		end
 	end
 	return nil
+end
+
+local function httpGet(url)
+	return httpRequest(url, "GET", nil, nil)
+end
+
+--[[
+	WHICH SERVER IS A NAMED PLAYER IN?
+
+	Two API calls, both POST, both in the same executor-agnostic wrapper the
+	server list already uses:
+
+	    users.roblox.com/v1/usernames/users   name   -> userId
+	    presence.roblox.com/v1/presence/users userId -> gameId (the JOB id)
+
+	Returns nil for every failure mode -- unknown name, private "offline" presence,
+	playing a different place, no HTTP -- because the caller's job is then to fall
+	through to the next rung of the chain (私服 -> 人少的服务器), not to raise.
+]]
+function Rejoin.playerJobId(self, name)
+	if name == nil or name == "" then
+		return nil
+	end
+	local now = os.clock()
+	local cached = self.playerCache
+	if cached ~= nil and cached.name == name and now - cached.at < PLAYER_CACHE then
+		return cached.jobId
+	end
+
+	local function remember(jobId)
+		self.playerCache = { name = name, jobId = jobId, at = now }
+		return jobId
+	end
+
+	local resolveBody = HttpService:JSONEncode({ usernames = { name }, excludeBannedUsers = false })
+	local resolvedText = httpRequest("https://users.roblox.com/v1/usernames/users", "POST", resolveBody)
+	if resolvedText == nil then
+		return remember(nil)
+	end
+	local okResolve, resolved = pcall(function()
+		return HttpService:JSONDecode(resolvedText)
+	end)
+	local resolvePayload = resolved :: any
+	if not okResolve or type(resolvePayload) ~= "table" or type(resolvePayload.data) ~= "table" then
+		return remember(nil)
+	end
+	local userId = nil
+	for _, entry in ipairs(resolvePayload.data) do
+		if type(entry) == "table" and entry.id ~= nil then
+			userId = entry.id
+			break
+		end
+	end
+	if userId == nil then
+		return remember(nil)
+	end
+
+	local presenceBody = HttpService:JSONEncode({ userIds = { userId } })
+	local presenceText = httpRequest("https://presence.roblox.com/v1/presence/users", "POST", presenceBody)
+	if presenceText == nil then
+		return remember(nil)
+	end
+	local okPresence, presence = pcall(function()
+		return HttpService:JSONDecode(presenceText)
+	end)
+	local presencePayload = presence :: any
+	if not okPresence or type(presencePayload) ~= "table" or type(presencePayload.userPresences) ~= "table" then
+		return remember(nil)
+	end
+	for _, entry in ipairs(presencePayload.userPresences) do
+		if type(entry) == "table" then
+			local placeId = tonumber(entry.placeId)
+			local gameId = entry.gameId
+			-- Same place and actually in a game: `gameId` IS the job id Roblox
+			-- accepts for TeleportToPlaceInstance. A different place is not a
+			-- rejoin target at all (we can only teleport inside this PlaceId).
+			if type(gameId) == "string" and gameId ~= "" and (placeId == nil or placeId == game.PlaceId) then
+				return remember(gameId)
+			end
+		end
+	end
+	return remember(nil)
 end
 
 --[[
@@ -12701,54 +13583,150 @@ function Rejoin.fetchServers(self, order)
 end
 
 --[[
-	Actually leave. Runs off the frame path (see the module comment).
+	Actually leave -- ONE ATTEMPT AT A TIME, AND VERIFIED.
 
-	`modeOverride` lets a caller name its own target server for THIS request --
-	the event-boss hop uses it, because "back to this server" is never a useful
-	answer to "the bosses here are all dead". Omitted, the configured
-	`rejoin.mode` applies, which is what every other caller wants.
+	The old shape fired every candidate in a loop and stopped at the first call
+	that did not raise. That is not "we joined": `TeleportToPlaceInstance` returns
+	immediately and the join itself happens afterwards, so a FULL server fails
+	SILENTLY -- the player stays where he is, `_triggered` stays true, and the
+	reported symptom is exactly "明明已经重进了，但是服务器 ID 还没变，那么它会再次
+	尝试重进" (or, worse, it retried nothing at all because it believed it had
+	succeeded).
+
+	Now: the attempt is recorded, and `Rejoin.hopWatch` checks a few seconds later
+	whether `game.JobId` actually changed. If it did not, the next rung of the
+	gradient chain is tried; if the chain runs out, the state machine is released
+	so the user (or the trigger) can try again instead of being stuck.
+
+	`modeOverride` lets a caller name its own target for THIS request -- the
+	event-boss hop does, because "back to this server" is never a useful answer to
+	"the bosses here are all dead".
 ]]
 function Rejoin.perform(self, reason, modeOverride)
 	self.notify("正在重进...", "warn")
 
 	local mode = modeOverride or self.store:get("rejoin.mode") or "same"
-	local servers = {}
-	if mode ~= "private" then
-		local order = if mode == "sparse" then "Asc" else "Desc"
-		servers = Rejoin.fetchServers(self, order) or {}
+	local order = if mode == "sparse" or mode == "player" or mode == "private" then "Asc" else "Desc"
+	local servers = if mode == "private" then {} else (Rejoin.fetchServers(self, order) or {})
+
+	-- The player lookup only happens for the mode that needs it, and it is
+	-- cached (PLAYER_CACHE), so a retry loop does not hammer the presence API.
+	local targetJobId = nil
+	if mode == "player" then
+		local name = self.store:get("rejoin.targetPlayer")
+		targetJobId = Rejoin.playerJobId(self, if type(name) == "string" then name else "")
+		if targetJobId == nil then
+			self.notify(string.format("找不到目标玩家 %s，按梯度降级", tostring(name or "")), "warn")
+		end
 	end
 
-	local plan = ServerPick.plan(mode, servers, game.JobId, self.store:get("rejoin.privId"))
+	local attempts = ServerPick.chain(mode, servers, game.JobId, self.store:get("rejoin.privId"), targetJobId)
+	self.plan = attempts
+	self.planIndex = 0
+	return Rejoin.attemptNext(self, reason)
+end
+
+--[[
+	Try the next rung. Returns true when an attempt was actually dispatched.
+]]
+function Rejoin.attemptNext(self, reason)
+	local attempts = self.plan
+	if attempts == nil then
+		return false
+	end
 	local user = Players.LocalPlayer
 	if user == nil then
 		return false
 	end
 
-	if plan.code ~= nil then
-		local ok = pcall(function()
-			TeleportService:TeleportToPrivateServer(game.PlaceId, plan.code, { user })
-		end)
+	while true do
+		self.planIndex += 1
+		local attempt = attempts[self.planIndex]
+		if attempt == nil then
+			--[[
+				THE CHAIN IS EXHAUSTED.
+
+				Every rung was tried and the job id never changed. Latching
+				`_triggered` here would make the rejoin feature dead for the rest
+				of the session ("它会再次尝试重进" was the complaint, but never
+				retrying is just as wrong), so the state machine is RELEASED and the
+				user is told, with the last reason.
+			]]
+			self.notify("换服失败：所有目标都没进去（可能都满了）", "error")
+			Rejoin.reset(self)
+			self.plan = nil
+			return false
+		end
+
+		-- The rung we are already on is not a rejoin.
+		if attempt.kind == "job" and (attempt.id == nil or attempt.id == "" or attempt.id == game.JobId) then
+			if attempt.id == game.JobId and self.planIndex < #attempts then
+				continue
+			end
+			if attempt.id == nil or attempt.id == "" then
+				continue
+			end
+			-- Same server as the last rung and nothing else left: stop.
+			self.notify("没有可换的服务器，留在当前服", "warn")
+			Rejoin.reset(self)
+			self.plan = nil
+			return false
+		end
+
+		self.hopJobId = game.JobId
+		self.hopAt = os.clock()
+		self.hopLabel = attempt.label
+		self.attempts += 1
+
+		local ok = false
+		if attempt.kind == "private" then
+			ok = pcall(function()
+				TeleportService:TeleportToPrivateServer(game.PlaceId, attempt.code, { user })
+			end)
+		else
+			ok = pcall(function()
+				TeleportService:TeleportToPlaceInstance(game.PlaceId, attempt.id, user)
+			end)
+		end
+
 		if ok then
-			self.attempts += 1
+			self.notify(string.format("尝试换服：%s", attempt.label), "info")
 			return true
 		end
+
+		-- The call itself failed: this rung is not usable, try the next now.
+		self.notify(string.format("%s 无法传送，试下一个目标", attempt.label), "warn")
+	end
+end
+
+--[[
+	DID THE HOP ACTUALLY HAPPEN?
+
+	Checked from a 1 Hz task. `game.JobId` is the only honest answer: a teleport
+	call succeeding while the server stays the same means the target was full, in
+	which case the next rung is tried.
+]]
+function Rejoin.hopWatch(self, now)
+	if self.hopAt == nil or self.hopAt == 0 then
+		return
+	end
+	if now - self.hopAt < HOP_TIMEOUT then
+		return
 	end
 
-	for _, id in ipairs(plan.ids) do
-		local ok = pcall(function()
-			TeleportService:TeleportToPlaceInstance(game.PlaceId, id, user)
-		end)
-		if ok then
-			self.attempts += 1
-			return true
-		end
+	if game.JobId ~= self.hopJobId then
+		-- We are somewhere else: nothing left to do (the session is being
+		-- replaced by whatever the hop landed in).
+		self.hopAt = 0
+		return
 	end
 
-	self.notify("服务器尝试失败，返回原服", "warn")
-	pcall(function()
-		TeleportService:Teleport(game.PlaceId, user)
-	end)
-	return false
+	self.hopAt = 0
+	self.notify(string.format("%s 超时未生效（多半已满），自动降级", tostring(self.hopLabel or "目标服务器")), "warn")
+	if Rejoin.attemptNext(self, "hop-timeout") == false then
+		-- attemptNext released the state machine when the chain ran out.
+		self.hopAt = 0
+	end
 end
 
 -- Off-frame wrapper. The only task.spawn in the refactor, and documented above.
@@ -13013,6 +13991,27 @@ function Rejoin.install(context)
 		end,
 		tick = function(_dt, now)
 			Rejoin.emergencyTick(self, now)
+		end,
+	})
+
+	--[[
+		THE HOP WATCHDOG -- always on, and deliberately NOT gated on any switch.
+
+		A hop is started by many callers (the memory/FPS/ping trigger, the timer,
+		the emergency prompt, the event-boss hop, the manual button). Once one is
+		in flight, THIS is what decides whether it worked, because only waiting and
+		comparing `game.JobId` can tell a join from a full server. Gating it on
+		`rejoin.enabled` would leave the event-boss hop stuck forever with
+		`_triggered` set.
+	]]
+	self.scheduler:register({
+		id = "hopWatch",
+		priority = 48,
+		enabled = function()
+			return true
+		end,
+		tick = function(_dt, now)
+			Rejoin.hopWatch(self, now)
 		end,
 	})
 
@@ -16161,6 +17160,7 @@ Shell.TASK_LABELS = {
 	]]
 	["bossPunch"] = "打Boss出拳",
 	["eventHop"] = "活动Boss换服",
+	["crystal"] = "开水晶",
 	["punchGuard"] = "保持拳套",
 	["damageHold"] = "伤害优先",
 	["trainDepth"] = "锻炼深度",
@@ -20399,6 +21399,20 @@ Page.build = function(kit, page, shell)
 
 	kit:note(machines, "健身房是分类：选了健身房，下面的器械名和编号只列那个健身房的")
 	kit:note(machines, "多人同器械时会自动换一台空闲的；列表每 6 秒重新扫描一次")
+	--[[
+		器械 vs 战斗.
+
+		Default OFF keeps the documented priority (打 Boss > 全城杀戮 > 器械): the
+		machine releases the seat while something needs to punch. But with
+		auto-boss on there is nearly always a boss alive, so the machine looks
+		permanently "不上" -- this switch is the explicit opposite, and when it is
+		on the status line below stops reporting a block.
+	]]
+	kit:toggle(machines, {
+		label = "器械优先（战斗中也不让位）",
+		path = "machine.overridesCombat",
+		hint = "默认关闭：打 Boss / 杀戮时会自动让位；打开后器械不再被抢占",
+	})
 	refreshMachines(true)
 
 	--[[
@@ -21758,6 +22772,159 @@ Page.build = function(kit, page, shell)
 
 	kit:toggle(shop, { label = "自动购买", path = "pet.autoBuy" })
 
+	--[[
+		CRYSTALS -- hatching, and the auto-sell list that goes with it.
+
+		The game's own protocol (confirmed from a Cobalt recording):
+
+		    Remote:InvokeServer("openCrystal", "Hallowed Crystal")
+		    Remote:InvokeServer("saveAutoSell", "Hallowed Crystal",
+		        { Pets = { ["Candy Cube"] = true, ... }, Enabled = false, Auras = {} })
+
+		Both are per-crystal, so the picker is built from the live catalogue
+		(`shared.catalogs.crystalChances`) instead of hard-coding the one crystal
+		the recording happened to use -- the next event brings a new one.
+	]]
+	kit:section(page, "水晶（开蛋 / 自动出售）")
+	local crystals = services.crystals
+	local crystalCard = kit:card(page)
+
+	local crystalDropdown
+	if crystals == nil then
+		kit:note(crystalCard, "水晶模块未加载")
+	else
+		local function crystalLabels()
+			local out = crystals:labels()
+			if #out == 0 then
+				return { "—" }
+			end
+			return out
+		end
+		crystalDropdown = kit:dropdown(crystalCard, {
+			label = "选择水晶",
+			values = crystalLabels(),
+			path = "crystal.selected",
+			default = "",
+			map = {
+				-- The dropdown shows "名字（价格）" but the remote takes the bare
+				-- NAME, so the label is stripped on the way into the store.
+				toStore = function(display)
+					if display == "—" then
+						return ""
+					end
+					local name = string.match(display, "^(.-)（")
+					return if name ~= nil and name ~= "" then name else display
+				end,
+				fromStore = function(stored)
+					if stored == nil or stored == "" then
+						return "—"
+					end
+					return crystals:labelFor(tostring(stored))
+				end,
+			},
+		})
+		kit:button(crystalCard, {
+			label = "刷新水晶列表",
+			onClick = function()
+				if crystalDropdown ~= nil then
+					crystalDropdown.refresh(crystalLabels(), crystalDropdown.get())
+				end
+			end,
+		})
+		-- 6 s, like the machine list: the catalogue arrives with the game data.
+		local timers = shell.timers
+		if timers ~= nil then
+			timers:every(os.clock(), 6, function()
+				if crystalDropdown ~= nil then
+					crystalDropdown.refresh(crystalLabels(), nil)
+				end
+			end)
+		end
+	end
+
+	kit:toggle(crystalCard, {
+		label = "自动开水晶",
+		path = "crystal.auto",
+		hint = "按下面的频率对着所选水晶调用 openCrystal",
+	})
+	kit:slider(crystalCard, {
+		label = "开水晶频率（次/秒）",
+		path = "crystal.rate",
+		min = 1,
+		max = 20,
+		default = 2,
+		commitOnly = true,
+		hint = "一次只发一个请求，慢服务器不会堆积",
+	})
+
+	kit:toggle(crystalCard, {
+		label = "自动出售该水晶的宠物",
+		path = "crystal.autoSell",
+		hint = "保存到服务器的自动出售配置（saveAutoSell）",
+	})
+	kit:dualButtons(crystalCard, {
+		label = "生成出售列表（该水晶全部宠物）",
+		onClick = function()
+			if crystals == nil then
+				return
+			end
+			local count = crystals:fillSellFromPool()
+			if count > 0 then
+				shell:toast(string.format("已把该水晶的 %d 种宠物加入出售列表", count), "success")
+			end
+		end,
+	}, {
+		label = "应用出售配置",
+		role = "Green",
+		onClick = function()
+			if crystals ~= nil and crystals:applyAutoSell() then
+				shell:toast("已把自动出售配置发给服务器", "success")
+			end
+		end,
+	})
+
+	local sellLabel = kit:instance("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 20),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamMedium,
+		Text = "出售列表：-",
+		TextColor3 = kit:color("TextSecond"),
+		TextSize = 12,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		LayoutOrder = kit:nextOrder(crystalCard),
+	}, crystalCard)
+
+	local crystalStatus = kit:instance("TextLabel", {
+		Size = UDim2.new(1, 0, 0, 20),
+		BackgroundTransparency = 1,
+		Font = Enum.Font.GothamMedium,
+		Text = "水晶状态：-",
+		TextColor3 = kit:color("TextSecond"),
+		TextSize = 12,
+		TextXAlignment = Enum.TextXAlignment.Left,
+		LayoutOrder = kit:nextOrder(crystalCard),
+	}, crystalCard)
+
+	shell:addUiTick(function()
+		local stored = kit.store:get("crystal.sellPets")
+		local names = {}
+		if type(stored) == "table" then
+			for _, entry in ipairs(stored) do
+				if type(entry) == "table" and type(entry.name) == "string" then
+					table.insert(names, entry.name)
+				end
+			end
+		end
+		sellLabel.Text = if #names == 0
+			then "出售列表：（空，点上面按钮生成）"
+			else string.format("出售列表：%d 种 · %s", #names, table.concat(names, "、"))
+		if crystals ~= nil then
+			local stats = crystals:stats()
+			crystalStatus.Text = string.format("水晶状态：已开 %d · 配置 %d 次 · 列表 %d 个 · 最近 %s",
+				stats.opened, stats.applied, stats.count, tostring(stats.last))
+		end
+	end)
+
 	kit:section(page, "宠物收益")
 	local metricsCard = kit:card(page)
 	local metricsLabel = kit:instance("TextLabel", {
@@ -21812,6 +22979,15 @@ local REJOIN_MODES = {
 	{ display = "人多的服务器", value = "crowded" },
 	{ display = "私服", value = "private" },
 	{ display = "人少的服务器", value = "sparse" },
+	--[[
+		目标玩家所在服务器.
+
+		The username is resolved at rejoin time (users.roblox.com -> presence) and
+		the fallback chain is the point of the mode: that player's server, else the
+		private code if one is configured, else the quietest public servers, else
+		this server. See core/ServerPick.chain.
+	]]
+	{ display = "目标玩家所在服务器", value = "player" },
 }
 
 local function rejoinLabels()
@@ -22060,6 +23236,19 @@ Page.build = function(kit, page, shell)
 		path = "rejoin.privId",
 		default = "",
 		placeholder = "链接或 code",
+	})
+	--[[
+		目标玩家.
+
+		Read by `rejoin.mode == "player"`; an unknown / offline / other-place player
+		falls through the gradient chain instead of failing the rejoin.
+	]]
+	kit:textInput(rejoin, {
+		label = "目标玩家用户名",
+		path = "rejoin.targetPlayer",
+		default = "",
+		placeholder = "例如 Notch",
+		hint = "找不到该玩家时：私服 → 人少的服务器 → 原服务器",
 	})
 	kit:toggle(rejoin, { label = "紧急重进（掉线 / 报错弹窗）", path = "rejoin.emergEnabled" })
 	kit:divider(rejoin)
@@ -22521,6 +23710,7 @@ local Combat = require("game/Combat")
 local Boss = require("game/Boss")
 local Size = require("game/Size")
 local Pets = require("game/Pets")
+local Crystals = require("game/Crystals")
 local PetMetrics = require("game/PetMetrics")
 local Machine = require("game/Machine")
 local PlayerStats = require("game/PlayerStats")
@@ -22933,6 +24123,16 @@ function Main.start()
 
 	local perf = Perf.install({ store = store, scheduler = runtime.scheduler })
 
+	-- Crystals is installed here (not inside the character block) because it needs
+	-- nothing but the store and the scheduler: opening a crystal and pushing the
+	-- auto-sell list are remote calls, not character work.
+	local crystals = Crystals.install({
+		store = store,
+		scheduler = runtime.scheduler,
+		timers = runtime.timers,
+		notify = notify("crystal"),
+	})
+
 	-- The pause switch is a store key rather than a special-case call, so the
 	-- settings toggle and any future keybind drive the same thing.
 	runtime.scheduler:setPaused(store:get("runtime.paused") == true)
@@ -23321,6 +24521,7 @@ function Main.start()
 				combat = combat,
 				machine = machine,
 				pets = pets,
+				crystals = crystals,
 				rebirth = rebirth,
 				metrics = metrics,
 				rejoin = rejoin,
